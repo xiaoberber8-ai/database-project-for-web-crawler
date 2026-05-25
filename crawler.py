@@ -44,6 +44,9 @@ class Website(Base):
     company_info = Column(Text)
     contact_info = Column(Text)
 
+    # 【新增】关联：一个网站包含多个网页
+    webpages = relationship("WebPage", back_populates="website")
+
 
 class WebPage(Base):
     __tablename__ = "webpage"
@@ -62,12 +65,21 @@ class WebPage(Base):
         UniqueConstraint("website_id", "url_hash", name="uq_webpage_website_urlhash"),
     )
 
+    # 【新增】关联：双向绑定
+    website = relationship("Website", back_populates="webpages")
+    task = relationship("TaskRecord", back_populates="webpages")
+    contents = relationship("Content", back_populates="webpage")
+    images = relationship("Image", back_populates="webpage")
+
 
 class DataSource(Base):
     __tablename__ = "datasource"
     id = Column(Integer, primary_key=True)
     publisher_name = Column(String(255))
     origin_url = Column(Text)
+
+    # 【新增】关联：一个数据源对应多篇文章
+    contents = relationship("Content", back_populates="datasource")
 
 
 class Content(Base):
@@ -80,6 +92,10 @@ class Content(Base):
     publish_time = Column(DateTime)
     keywords = Column(Text)
 
+    # 【新增】关联：属于哪个网页，属于哪个数据源
+    webpage = relationship("WebPage", back_populates="contents")
+    datasource = relationship("DataSource", back_populates="contents")
+
 
 class Image(Base):
     __tablename__ = "image"
@@ -89,12 +105,18 @@ class Image(Base):
     local_path = Column(Text)
     description = Column(Text)
 
+    # 【新增】关联：图片属于哪个网页
+    webpage = relationship("WebPage", back_populates="images")
+
 
 class Admin(Base):
     __tablename__ = "admin"
     id = Column(Integer, primary_key=True)
     Username = Column(String(100), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
+
+    # 【新增】关联：一个管理员可以创建多个策略
+    strategies = relationship("CrawlerStrategy", back_populates="creator")
 
 
 class CrawlerStrategy(Base):
@@ -107,6 +129,10 @@ class CrawlerStrategy(Base):
     Frequency = Column(String(50), default="manual")
     creator_id = Column(Integer, ForeignKey("admin.id"))
 
+    # 【新增】关联：谁创建的策略，以及这个策略跑了哪些任务
+    creator = relationship("Admin", back_populates="strategies")
+    tasks = relationship("TaskRecord", back_populates="strategy")
+
 
 class TaskRecord(Base):
     __tablename__ = "task_record"
@@ -118,9 +144,12 @@ class TaskRecord(Base):
     item_count = Column(Integer, default=0)
     error_message = Column(Text)
 
+    # 【新增】关联：属于哪个策略，以及包含了哪些爬取下来的网页
+    strategy = relationship("CrawlerStrategy", back_populates="tasks")
+    webpages = relationship("WebPage", back_populates="task")
+
 
 Base.metadata.create_all(engine)
-
 
 
 # 策略结构
