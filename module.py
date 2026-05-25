@@ -1,21 +1,29 @@
 # 在你的 Ubuntu/WSL 终端中安装 FastAPI 和本地运行服务器 uvicorn：
 pip install fastapi uvicorn
-
-# 新建main.py，假设爬虫文件是crawler.py
-# 内容如下
-
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, BackgroundTasks, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import or_, func
+from pydantic import BaseModel
 from datetime import date
+import io
+import csv
+import re
+import os
 
-# 假设你上面的爬虫代码保存在了 crawler_models.py 中
-# 我们直接引入配置好的 SessionLocal 和 数据库表模型
-from crawler import SessionLocal, Content, WebPage, TaskRecord, CrawlerStrategy
+# 1. 核心：直接从你现有的代码库中导入所有东西！
+from Crawl_module import SessionLocal, Content, WebPage, TaskRecord, CrawlerStrategy, Image, CrawlerExecutor
 
-app = FastAPI(title="网络数据爬取管理系统 API")
+app = FastAPI(title="网络数据爬取管理系统 API (集成测试版)")
 
-# 依赖项：每次请求获取一个数据库会话，用完自动关闭
+# 2. 实例化全局爬虫执行器
+global_crawler = CrawlerExecutor()
+
+# 如果 images 文件夹不存在，帮忙建一个，防止挂载静态资源时报错
+os.makedirs("./images", exist_ok=True)
+app.mount("/images", StaticFiles(directory="./images"), name="images")
+
 def get_db():
     db = SessionLocal()
     try:
@@ -24,23 +32,43 @@ def get_db():
         db.close()
 
 # ==========================================
-# 一、 工作台 (Dashboard) 模块接口
+# 模块一：爬虫真实控制 API
+# ==========================================
+@app.post("/api/strategy/{strategy_id}/run", summary="真实启动爬虫 (后台运行)")
+def run_strategy(strategy_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    strategy = db.query(CrawlerStrategy).filter(CrawlerStrategy.id == strategy_id).first()
+    if not strategy:
+        raise HTTPException(status_code=404, detail="策略不存在")
+    
+    global_crawler.stop_event.clear()
+    global_crawler.pause_event.set()
+    # 将爬虫任务推入后台，立刻返回成功响应给前端
+    background_tasks.add_task(global_crawler.crawl_strategy, strategy_id)
+    return {"message": f"策略 {strategy_id} 已在后台开始执行，请查看终端运行日志"}
+
+@app.post("/api/crawler/pause", summary="暂停爬虫")
+def pause_crawler():
+    global_crawler.pause()
+    return {"message": "爬虫已暂停"}
+
+@app.post("/api/crawler/resume", summary="恢复爬虫")
+def resume_crawler():
+    global_crawler.resume()
+    return {"message": "爬虫已恢复运行"}
+
+@app.post("/api/crawler/stop", summary="强制停止爬虫")
+def stop_crawler():
+    global_crawler.stop()
+    return {"message": "发送停止指令成功，爬虫将在当前请求完成后退出"}
+
+# ==========================================
+# 模块二：Dashboard 大屏统计
 # ==========================================
 @app.get("/api/dashboard/stats", summary="获取大屏概览统计")
 def get_dashboard_stats(db: Session = Depends(get_db)):
-    # 1. 总抓取文章量
     total_content = db.query(Content).count()
-    
-    # 2. 今日新增网页数 (注意大小写，匹配你的 ORM 定义)
-    today = date.today()
-    today_new = db.query(WebPage).filter(
-        func.date(WebPage.fetch_time) == today
-    ).count()
-    
-    # 3. 活跃任务数 (匹配你设定的 Status 字段)
-    active_tasks = db.query(TaskRecord).filter(
-        TaskRecord.Status == "running"
-    ).count()
+    today_new = db.query(WebPage).filter(func.date(WebPage.fetch_time) == date.today()).count()
+    active_tasks = db.query(TaskRecord).filter(TaskRecord.Status == "running").count()
     
     return {
         "total_content": total_content,
@@ -49,56 +77,124 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     }
 
 # ==========================================
-# 二、 数据中心模块接口
+# 模块三：高级检索与高亮
 # ==========================================
-@app.get("/api/content/list", summary="获取清洗后的文章列表")
-def get_content_list(skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
-    # 多表联查：查询 Content 并带出关联的 WebPage 的 url
-    results = db.query(Content, WebPage.url, WebPage.fetch_time)\
-        .join(WebPage, Content.webpage_id == WebPage.id)\
-        .order_by(WebPage.fetch_time.desc())\
-        .offset(skip).limit(limit).all()
+@app.get("/api/search", summary="高级检索 (支持高亮和分页)")
+def advanced_search(
+    keyword: str = Query(None, description="搜索关键词"),
+    skip: int = Query(0, description="分页起始点"),
+    limit: int = Query(20, description="每页数量"),
+    db: Session = Depends(get_db)
+):
+    # 手动联表查询：Content + WebPage
+    query = db.query(Content, WebPage.url, WebPage.fetch_time).join(WebPage, Content.webpage_id == WebPage.id)
     
-    # 将结果格式化为前端好用的 JSON
+    if keyword:
+        search_rule = f"%{keyword}%"
+        query = query.filter(or_(Content.Title.ilike(search_rule), Content.text_body.ilike(search_rule)))
+        
+    total = query.count()
+    results = query.order_by(WebPage.fetch_time.desc()).offset(skip).limit(limit).all()
+    
     data = []
     for content, url, fetch_time in results:
+        title = content.Title or ""
+        body_preview = (content.text_body or "")[:150] + "..."
+        
+        # 关键词高亮包裹
+        if keyword:
+            pattern = re.compile(f"({re.escape(keyword)})", re.IGNORECASE)
+            title = pattern.sub(r"<mark>\1</mark>", title)
+            body_preview = pattern.sub(r"<mark>\1</mark>", body_preview)
+            
         data.append({
             "id": content.id,
-            "title": content.Title,  # 你的模型里是 Title 大写
-            "text_preview": content.text_body[:100] + "..." if content.text_body else "",
+            "title_highlight": title,
+            "preview_highlight": body_preview,
             "source_url": url,
             "fetch_time": fetch_time
         })
-    return {"total": len(data), "data": data}
-
-# ==========================================
-# 三、 高级检索模块接口
-# ==========================================
-@app.get("/api/search", summary="综合搜索引擎")
-def search_content(keyword: str = Query(..., description="搜索关键字"), db: Session = Depends(get_db)):
-    # 在标题或正文中模糊查找
-    search_rule = f"%{keyword}%"
-    results = db.query(Content, WebPage.url)\
-        .join(WebPage, Content.webpage_id == WebPage.id)\
-        .filter(
-            (Content.Title.ilike(search_rule)) | (Content.text_body.ilike(search_rule))
-        )\
-        .limit(100).all()
         
-    data = [{"title": c.Title, "url": u} for c, u in results]
-    return {"keyword": keyword, "matches": len(data), "results": data}
+    return {"total": total, "data": data}
 
 # ==========================================
-# 四、 爬虫任务管理接口
+# 模块四：文章详情与图片预览
 # ==========================================
-@app.post("/api/strategy/{strategy_id}/run", summary="手动触发一个爬虫策略")
-def run_strategy(strategy_id: int):
-    # 这里可以调用你爬虫代码里的 CrawlerExecutor().crawl_strategy(strategy_id)
-    # 实际开发中，建议用 Celery 或后台任务来跑，防止阻塞接口
-    return {"message": f"策略 {strategy_id} 已下发执行队列"}
+@app.get("/api/content/{content_id}", summary="获取文章详情及关联图片")
+def get_content_detail(content_id: int, db: Session = Depends(get_db)):
+    # 1. 查文章
+    content = db.query(Content).filter(Content.id == content_id).first()
+    if not content:
+        raise HTTPException(status_code=404, detail="文章不存在")
+        
+    # 2. 查网页 URL
+    webpage = db.query(WebPage).filter(WebPage.id == content.webpage_id).first()
+    
+    # 3. 手动查属于该网页的图片 (因为没有 relationship)
+    db_images = db.query(Image).filter(Image.webpage_id == content.webpage_id).all()
+    image_list = [{"url": f"/images/{os.path.basename(img.local_path)}", "desc": img.description} for img in db_images if img.local_path]
 
+    return {
+        "id": content.id,
+        "title": content.Title,
+        "body": content.text_body,
+        "source_url": webpage.url if webpage else None,
+        "images": image_list
+    }
 
+# ==========================================
+# 模块五：数据导出
+# ==========================================
+@app.get("/api/export/csv", summary="导出为 CSV 文件")
+def export_csv(db: Session = Depends(get_db)):
+    results = db.query(Content, WebPage.fetch_time).outerjoin(WebPage, Content.webpage_id == WebPage.id).all()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "标题", "正文摘要", "抓取时间"])
+    
+    for content, fetch_time in results:
+        time_str = fetch_time.strftime("%Y-%m-%d %H:%M:%S") if fetch_time else ""
+        writer.writerow([content.id, content.Title, (content.text_body or "")[:100] + "...", time_str])
+        
+    output.seek(0)
+    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=crawled_data.csv"})
 
+# ==========================================
+# 模块六：策略管理 API (CRUD)
+# ==========================================
+
+# 定义接收前端数据的结构体 (让 FastAPI 知道前端会传什么格式的数据过来)
+class StrategyCreate(BaseModel):
+    name: str
+    target_url: str
+    rules_json: str
+
+@app.post("/api/strategy", summary="新建爬虫策略")
+def create_strategy(data: StrategyCreate, db: Session = Depends(get_db)):
+    # 接收前端传来的数据，并在数据库中创建新记录
+    new_strategy = CrawlerStrategy(
+        name=data.name,
+        target_url=data.target_url,
+        rules_json=data.rules_json,
+        Status="enabled",
+        Frequency="manual"
+    )
+    db.add(new_strategy)
+    db.commit()
+    db.refresh(new_strategy)
+    
+    return {
+        "message": "策略创建成功", 
+        "id": new_strategy.id,
+        "name": new_strategy.name
+    }
+
+@app.get("/api/strategy", summary="获取所有策略列表")
+def get_strategies(db: Session = Depends(get_db)):
+    # 查询所有策略，按 ID 倒序排列（最新的在最前面）
+    strategies = db.query(CrawlerStrategy).order_by(CrawlerStrategy.id.desc()).all()
+    return strategies
 
 # 编好后，在终端运行
 uvicorn main:app --reload
