@@ -1,3 +1,130 @@
+把crawler文件中的数据库设计改成：
+# =========================
+# 数据库模型 (完整关联版)
+# =========================
+
+class Admin(Base):
+    __tablename__ = "admin"
+    id = Column(Integer, primary_key=True)
+    Username = Column(String(100), unique=True, nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    
+    # 关联：管理员创建的策略
+    strategies = relationship("CrawlerStrategy", back_populates="creator")
+
+
+class CrawlerStrategy(Base):
+    __tablename__ = "crawler_strategy"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False, index=True)
+    target_url = Column(Text, nullable=False)
+    rules_json = Column(Text, nullable=False)
+    Status = Column(String(50), default="enabled")
+    Frequency = Column(String(50), default="manual")
+    creator_id = Column(Integer, ForeignKey("admin.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # 关联：双向绑定创建者与任务记录
+    creator = relationship("Admin", back_populates="strategies", lazy="joined")
+    tasks = relationship("TaskRecord", back_populates="strategy")
+
+
+class TaskRecord(Base):
+    __tablename__ = "task_record"
+    id = Column(Integer, primary_key=True)
+    strategy_id = Column(Integer, ForeignKey("crawler_strategy.id"), nullable=False, index=True)
+    start_time = Column(DateTime)
+    Status = Column(String(50), default="pending")
+    end_time = Column(DateTime)
+    item_count = Column(Integer, default=0)
+    error_message = Column(Text)
+
+    # 关联：所属策略，以及该任务下抓取到的所有网页
+    strategy = relationship("CrawlerStrategy", back_populates="tasks", lazy="joined")
+    webpages = relationship("WebPage", back_populates="task")
+
+
+class Website(Base):
+    __tablename__ = "website"
+    id = Column(Integer, primary_key=True)
+    domain = Column(String(255), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    company_info = Column(Text)
+    contact_info = Column(Text)
+
+    # 关联：该网站下包含的所有网页 records
+    webpages = relationship("WebPage", back_populates="website")
+
+
+class WebPage(Base):
+    __tablename__ = "webpage"
+    id = Column(Integer, primary_key=True)
+    website_id = Column(Integer, ForeignKey("website.id"), nullable=False, index=True)
+    task_id = Column(Integer, ForeignKey("task_record.id"), nullable=False, index=True)
+    url = Column(Text, nullable=False)
+    url_hash = Column(String(64), nullable=False, index=True)
+    fetch_time = Column(DateTime)
+    http_status = Column(Integer)
+    process_status = Column(String(50), default="pending")
+    page_type = Column(String(50), default="unknown")
+    error_message = Column(Text)
+
+    __table_args__ = (
+        UniqueConstraint("website_id", "url_hash", name="uq_webpage_website_urlhash"),
+    )
+
+    # 核心枢纽关联：向上连网站和任务，向下连内容和图片
+    website = relationship("Website", back_populates="webpages")
+    task = relationship("TaskRecord", back_populates="webpages")
+    contents = relationship("Content", back_populates="webpage")
+    images = relationship("Image", back_populates="webpage")
+
+
+class DataSource(Base):
+    __tablename__ = "datasource"
+    id = Column(Integer, primary_key=True)
+    publisher_name = Column(String(255))
+    origin_url = Column(Text)
+
+    # 关联：发布在这个平台上的所有内容记录
+    contents = relationship("Content", back_populates="datasource")
+
+
+class Content(Base):
+    __tablename__ = "content"
+    id = Column(Integer, primary_key=True)
+    webpage_id = Column(Integer, ForeignKey("webpage.id"), nullable=False, index=True)
+    datasource_id = Column(Integer, ForeignKey("datasource.id"))
+    Title = Column(String(500))
+    text_body = Column(Text)
+    publish_time = Column(DateTime)
+    keywords = Column(Text)
+
+    # 关联：所属的网页主体，以及对应的数据源
+    webpage = relationship("WebPage", back_populates="contents")
+    datasource = relationship("DataSource", back_populates="contents")
+
+
+class Image(Base):
+    __tablename__ = "image"
+    id = Column(Integer, primary_key=True)
+    webpage_id = Column(Integer, ForeignKey("webpage.id"), nullable=False, index=True)
+    image_url = Column(Text, nullable=False)
+    local_path = Column(Text)
+    description = Column(Text)
+
+    # 关联：图片所在的网页
+    webpage = relationship("WebPage", back_populates="images")
+
+
+Base.metadata.create_all(engine)
+
+
+
+
+
+以下为main文件代码：
 import io
 import csv
 import re
