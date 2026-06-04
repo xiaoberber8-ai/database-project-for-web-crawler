@@ -1,0 +1,348 @@
+import io
+import csv
+import re
+import os
+from datetime import date
+from fastapi import Depends, Query, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+from sqlalchemy import or_, func
+from pydantic import BaseModel
+from typing import Optional
+from CRAWLER_NEW import Admin, SystemSetting, hash_password, verify_password
+from pydantic import BaseModel
+from datetime import datetime, date
+from sqlalchemy import func
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+# 1. 核心：直接从队友的新文件中导入 app 实例和数据库模型！
+# 这样不仅避免了冲突，还能完美继承队友写好的所有高级接口。
+from CRAWLER_NEW import (
+    app, get_db, Content, WebPage, TaskRecord, Image, 
+    SessionLocal, CrawlerStrategy, DataSource
+)
+
+# 2. 挂载图片目录
+os.makedirs("./images", exist_ok=True)
+app.mount("/images", StaticFiles(directory="./images"), name="images")
+
+# 定义安全相关的 Pydantic 模型
+class AdminAuth(BaseModel):
+    username: str
+    password: str
+
+class PasswordChange(BaseModel):
+    username: str
+    old_password: str
+    new_password: str
+
+class SettingUpdatePayload(BaseModel):
+    value: str
+    description: Optional[str] = None
+
+# 初始化后台调度器
+scheduler = BackgroundScheduler()
+
+def scheduled_crawl_job(strategy_id: int):
+    """定时任务触发时的实际执行逻辑"""
+    print(f"⏰ 触发定时任务: 执行策略 ID {strategy_id}")
+    # 注意：定时任务在独立线程运行，需新建 DB session
+    db = SessionLocal()
+    try:
+        # 重置爬虫事件状态并启动新线程执行
+        crawler.stop_event.clear()
+        crawler.resume()
+        thread = threading.Thread(
+            target=crawler.crawl_strategy,
+            kwargs={"strategy_id": strategy_id},
+            daemon=True
+        )
+        thread.start()
+    finally:
+        db.close()
+
+def load_all_cron_jobs():
+    """从数据库加载所有配置了频率的策略到调度器"""
+    scheduler.remove_all_jobs()
+    db = SessionLocal()
+    try:
+        strategies = db.query(CrawlerStrategy).filter(
+            CrawlerStrategy.Status == "enabled",
+            CrawlerStrategy.Frequency != "manual",
+            CrawlerStrategy.Frequency != None
+        ).all()
+        
+        for strategy in strategies:
+            # 假设 Frequency 存储的是标准 Cron 表达式，如 "0 2 * * *" (分 时 日 月 周)
+            try:
+                cron_parts = strategy.Frequency.strip().split()
+                if len(cron_parts) == 5:
+                    trigger = CronTrigger(
+                        minute=cron_parts[0],
+                        hour=cron_parts[1],
+                        day=cron_parts[2],
+                        month=cron_parts[3],
+                        day_of_week=cron_parts[4]
+                    )
+                    scheduler.add_job(
+                        scheduled_crawl_job, 
+                        trigger=trigger, 
+                        args=[strategy.id], 
+                        id=f"strategy_{strategy.id}",
+                        replace_existing=True
+                    )
+                    print(f"✅ 成功加载定时任务: 策略 {strategy.name} -> {strategy.Frequency}")
+            except Exception as e:
+                print(f"❌ 策略 {strategy.name} 的 Cron 表达式解析失败: {e}")
+    finally:
+        db.close()
+
+# 绑定 FastAPI 生命周期，在服务启动时开启调度器
+@app.on_event("startup")
+def startup_event():
+    load_all_cron_jobs()
+    scheduler.start()
+    print("🚀 APScheduler 自动化调度引擎已启动")
+
+@app.on_event("shutdown")
+def shutdown_event():
+    scheduler.shutdown()
+# ==========================================
+# 补充模块一：Dashboard 大屏统计
+# ==========================================
+@app.get("/api/dashboard/stats", tags=["前端展示"], summary="获取大屏概览统计")
+def get_dashboard_stats(db: Session = Depends(get_db)):
+    total_content = db.query(Content).count()
+    today_new = db.query(WebPage).filter(func.date(WebPage.fetch_time) == date.today()).count()
+    active_tasks = db.query(TaskRecord).filter(TaskRecord.Status == "running").count()
+    
+    return {
+        "total_content": total_content,
+        "today_new": today_new,
+        "active_tasks": active_tasks
+    }
+
+@app.get("/api/tasks/{task_id}/progress", tags=["前端展示"], summary="获取指定任务的实时进度与成功率")
+def get_task_progress(task_id: int, db: Session = Depends(get_db)):
+    task = db.query(TaskRecord).filter(TaskRecord.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    # 聚合查询该任务下所有网页的处理状态
+    status_counts = db.query(WebPage.process_status, func.count(WebPage.id)).filter(
+        WebPage.task_id == task_id
+    ).group_by(WebPage.process_status).all()
+
+    stats = {
+        "pending": 0,       # 待抓取
+        "fetching": 0,      # 抓取中
+        "parsed": 0,        # 成功解析入库
+        "failed": 0,        # 抓取或解析报错
+        "skipped_non_html": 0 # 非网页资源跳过
+    }
+    
+    total_pages = 0
+    for status, count in status_counts:
+        stats[status] = count
+        total_pages += count
+
+    # 计算核心成功率 (成功解析数 / (总数 - 待抓取数))
+    attempted = total_pages - stats["pending"] - stats["fetching"]
+    success_rate = 0.0
+    if attempted > 0:
+        success_rate = round((stats["parsed"] / attempted) * 100, 2)
+
+    return {
+        "task_id": task.id,
+        "strategy_name": task.strategy.name if task.strategy else "未知策略",
+        "task_status": task.Status,
+        "total_discovered_urls": total_pages,
+        "success_rate_percent": success_rate,
+        "details": stats
+    }
+
+# ==========================================
+# 补充模块二：高级检索与高亮
+# ==========================================
+@app.get("/api/search", tags=["前端展示"], summary="高级检索 (支持时间、数据源过滤)")
+def advanced_search(
+    keyword: Optional[str] = Query(None, description="搜索关键词"),
+    start_date: Optional[date] = Query(None, description="发布时间起 (YYYY-MM-DD)"),
+    end_date: Optional[date] = Query(None, description="发布时间止 (YYYY-MM-DD)"),
+    publisher: Optional[str] = Query(None, description="发布者名称(模糊匹配)"),
+    skip: int = Query(0, description="分页起始点"),
+    limit: int = Query(20, description="每页数量"),
+    db: Session = Depends(get_db)
+):
+    # 使用外连接，确保即使没有 DataSource 的数据也能被搜到
+    query = db.query(Content).join(Content.webpage).outerjoin(Content.datasource)
+
+    if keyword:
+        search_rule = f"%{keyword}%"
+        query = query.filter(or_(Content.Title.ilike(search_rule), Content.text_body.ilike(search_rule)))
+    
+    if start_date:
+        query = query.filter(Content.publish_time >= start_date)
+    if end_date:
+        # 将结束日期的时间部分设为 23:59:59 以包含当天全天数据
+        end_datetime = datetime.combine(end_date, datetime.max.time())
+        query = query.filter(Content.publish_time <= end_datetime)
+        
+    if publisher:
+        # 基于刚优化的 DataSource 表进行细粒度筛选
+        query = query.filter(DataSource.publisher_name.ilike(f"%{publisher}%"))
+ 
+    total = query.count()
+    results = query.order_by(WebPage.fetch_time.desc()).offset(skip).limit(limit).all()
+    
+    data = []
+    for content in results:
+        title = content.Title or ""
+        body_preview = (content.text_body or "")[:150] + "..."
+        
+        if keyword:
+            pattern = re.compile(f"({re.escape(keyword)})", re.IGNORECASE)
+            title = pattern.sub(r"<mark>\1</mark>", title)
+            body_preview = pattern.sub(r"<mark>\1</mark>", body_preview)
+            
+        data.append({
+            "id": content.id,
+            "title_highlight": title,
+            "preview_highlight": body_preview,
+            "source_url": content.webpage.url if content.webpage else None,
+            "fetch_time": content.webpage.fetch_time if content.webpage else None
+        })
+        
+    return {"total": total, "data": data}
+
+# ==========================================
+# 补充模块三：文章详情与图片预览
+# ==========================================
+@app.get("/api/content/{content_id}", tags=["前端展示"], summary="获取文章详情及关联图片")
+def get_content_detail(content_id: int, db: Session = Depends(get_db)):
+    content = db.query(Content).filter(Content.id == content_id).first()
+    if not content:
+        raise HTTPException(status_code=404, detail="文章不存在")
+        
+    image_list = []
+    if content.webpage and content.webpage.images:
+        image_list = [
+            {"url": f"/images/{os.path.basename(img.local_path)}", "desc": img.description} 
+            for img in content.webpage.images if img.local_path
+        ]
+
+    return {
+        "id": content.id,
+        "title": content.Title,
+        "body": content.text_body,
+        "source_url": content.webpage.url if content.webpage else None,
+        "images": image_list
+    }
+
+# ==========================================
+# 补充模块四：数据导出
+# ==========================================
+@app.get("/api/export/csv", tags=["前端展示"], summary="导出为 CSV 文件")
+def export_csv(db: Session = Depends(get_db)):
+    contents = db.query(Content).all()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "标题", "正文摘要", "抓取时间"])
+    
+    for content in contents:
+        fetch_time = content.webpage.fetch_time if content.webpage else None
+        time_str = fetch_time.strftime("%Y-%m-%d %H:%M:%S") if fetch_time else ""
+        writer.writerow([content.id, content.Title, (content.text_body or "")[:100] + "...", time_str])
+        
+    output.seek(0)
+    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=crawled_data.csv"})
+
+# 定义数据更新的数据模型
+class ContentUpdate(BaseModel):
+    title: Optional[str] = None
+    text_body: Optional[str] = None
+
+# ==========================================
+# 补充模块五：数据管理 (编辑与删除)
+# ==========================================
+@app.put("/api/content/{content_id}", tags=["数据管理"], summary="修改已爬取的数据内容")
+def update_content(content_id: int, payload: ContentUpdate, db: Session = Depends(get_db)):
+    content = db.query(Content).filter(Content.id == content_id).first()
+    if not content:
+        raise HTTPException(status_code=404, detail="未找到该数据")
+    
+    if payload.title is not None:
+        content.Title = payload.title
+    if payload.text_body is not None:
+        content.text_body = payload.text_body
+        
+    db.commit()
+    db.refresh(content)
+    return {"msg": "数据更新成功", "id": content.id}
+
+@app.delete("/api/content/{content_id}", tags=["数据管理"], summary="删除指定数据")
+def delete_content(content_id: int, db: Session = Depends(get_db)):
+    content = db.query(Content).filter(Content.id == content_id).first()
+    if not content:
+        raise HTTPException(status_code=404, detail="未找到该数据")
+    
+    # 删除内容本身。关联的 WebPage 和 Image 可根据业务需求决定是否级联删除
+    db.delete(content)
+    db.commit()
+    return {"msg": "数据删除成功", "id": content_id}
+
+# ==========================================
+# 补充模块六：管理员鉴权与系统设置 API
+# ==========================================
+
+@app.post("/api/auth/register", tags=["系统设置"], summary="管理员账号注册")
+def register_admin(payload: AdminAuth, db: Session = Depends(get_db)):
+    exists = db.query(Admin).filter(Admin.Username == payload.username).first()
+    if exists:
+        raise HTTPException(status_code=400, detail="该用户名已被注册")
+    
+    new_admin = Admin(
+        Username=payload.username,
+        password_hash=hash_password(payload.password)
+    )
+    db.add(new_admin)
+    db.commit()
+    return {"msg": "管理员注册成功"}
+
+@app.post("/api/auth/login", tags=["系统设置"], summary="管理员登录（获取Token）")
+def login_admin(payload: AdminAuth, db: Session = Depends(get_db)):
+    admin = db.query(Admin).filter(Admin.Username == payload.username).first()
+    if not admin or not verify_password(payload.password, admin.password_hash):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    
+    # 这里可以生成一个简易的身份凭证返回给前端
+    return {"msg": "登录成功", "token": f"mock_token_for_{admin.Username}", "admin_id": admin.id}
+
+@app.post("/api/auth/change-password", tags=["系统设置"], summary="修改管理员密码")
+def change_password(payload: PasswordChange, db: Session = Depends(get_db)):
+    admin = db.query(Admin).filter(Admin.Username == payload.username).first()
+    if not admin or not verify_password(payload.old_password, admin.password_hash):
+        raise HTTPException(status_code=401, detail="原密码错误或用户不存在")
+    
+    admin.password_hash = hash_password(payload.new_password)
+    db.commit()
+    return {"msg": "密码修改成功"}
+
+@app.get("/api/settings", tags=["系统设置"], summary="获取全局系统参数列表")
+def get_all_settings(db: Session = Depends(get_db)):
+    return db.query(SystemSetting).all()
+
+@app.put("/api/settings/{key}", tags=["系统设置"], summary="配置或更新全局系统参数")
+def update_setting(key: str, payload: SettingUpdatePayload, db: Session = Depends(get_db)):
+    setting = db.query(SystemSetting).filter(SystemSetting.setting_key == key).first()
+    if not setting:
+        setting = SystemSetting(setting_key=key, setting_value=payload.value, description=payload.description)
+        db.add(setting)
+    else:
+        setting.setting_value = payload.value
+        if payload.description:
+            setting.description = payload.description
+    db.commit()
+    return {"msg": f"全局参数 [{key}] 配置成功", "value": payload.value}
