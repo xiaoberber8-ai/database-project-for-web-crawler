@@ -173,6 +173,34 @@
         <el-form-item label="图片目录">
           <el-input v-model="strategyForm.rules.image_rules.image_dir" placeholder="如：./images" />
         </el-form-item>
+        <el-form-item label="图片容器选择器">
+          <el-input v-model="strategyForm.rules.image_rules.image_container_selector" placeholder="如：.article-content（留空则回退正文区域）" />
+        </el-form-item>
+        <el-form-item label="只抓正文图片">
+          <el-switch v-model="strategyForm.rules.image_rules.only_article_images" />
+        </el-form-item>
+        <el-form-item label="最小宽度(px)">
+          <el-input-number v-model="strategyForm.rules.image_rules.min_width" :min="0" :max="5000" :step="10" />
+        </el-form-item>
+        <el-form-item label="最小高度(px)">
+          <el-input-number v-model="strategyForm.rules.image_rules.min_height" :min="0" :max="5000" :step="10" />
+        </el-form-item>
+        <el-form-item label="最小面积(px²)">
+          <el-input-number v-model="strategyForm.rules.image_rules.min_area" :min="0" :max="10000000" :step="1000" />
+        </el-form-item>
+        <el-form-item label="最大宽高比">
+          <el-input-number v-model="strategyForm.rules.image_rules.max_ratio" :min="1" :max="50" :step="0.5" :precision="1" />
+        </el-form-item>
+        <el-form-item label="过滤广告关键词">
+          <el-select
+            v-model="strategyForm.rules.image_rules.exclude_keywords"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            placeholder="输入关键词后回车，如 ad、logo"
+          />
+        </el-form-item>
         <el-divider content-position="left">请求设置</el-divider>
         <el-form-item label="超时时间(秒)">
           <el-input-number v-model="strategyForm.rules.timeout" :min="5" :max="120" />
@@ -194,6 +222,12 @@
             <el-option label="每周" value="weekly" />
           </el-select>
         </el-form-item>
+        <el-form-item label="重复数据处理">
+          <el-select v-model="strategyForm.rules.duplicate_action">
+            <el-option label="覆盖（重新抓取已爬过的页面）" value="overwrite" />
+            <el-option label="跳过（不重复抓取已爬过的页面）" value="skip" />
+          </el-select>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -211,7 +245,7 @@ import {
   startCrawl, pauseCrawl, resumeCrawl, stopCrawl, getCrawlStatus,
   getTasks
 } from '../api'
-import api from '../api'
+import axios from 'axios'
 
 const strategies = ref([])
 const tasks = ref([])
@@ -232,10 +266,22 @@ const defaultForm = () => ({
     allowed_domains: [],
     start_urls: [],
     text_rules: { title_selector: 'h1', body_selector: 'body' },
-    image_rules: { image_selector: 'img', download_images: true, image_dir: './images' },
+    image_rules: {
+      image_selector: 'img',
+      download_images: true,
+      image_dir: './images',
+      image_container_selector: null,
+      only_article_images: true,
+      min_width: 150,
+      min_height: 150,
+      min_area: 30000,
+      max_ratio: 5.0,
+      exclude_keywords: ['ad', 'ads', 'advert', 'banner', 'logo', 'icon', 'sprite', 'avatar', 'share', 'wechat', 'wx', 'tracking', 'pixel', 'recommend']
+    },
     headers: { 'User-Agent': 'Mozilla/5.0' },
     timeout: 30,
-    rate_limit: 1
+    rate_limit: 1,
+    duplicate_action: 'overwrite'
   },
   Status: 'enabled',
   Frequency: 'manual',
@@ -254,8 +300,8 @@ const formatTime = (t) => {
   return new Date(t).toLocaleString('zh-CN')
 }
 
-const statusType = (s) => ({ running: 'warning', completed: 'success', pending: 'info', failed: 'danger' }[s] || 'info')
-const statusText = (s) => ({ running: '运行中', completed: '已完成', pending: '等待中', failed: '失败' }[s] || s)
+const statusType = (s) => ({ running: 'warning', completed: 'success', pending: 'info', failed: 'danger', cancelled: 'info', interrupted: 'danger' }[s] || 'info')
+const statusText = (s) => ({ running: '运行中', completed: '已完成', pending: '等待中', failed: '失败', cancelled: '已取消', interrupted: '已中断' }[s] || s)
 
 // 修正任务状态：如果任务记录是running但线程已死，则显示为"已完成"
 const getTaskStatusType = (row) => {
@@ -289,10 +335,17 @@ const showCreateDialog = () => {
 const showEditDialog = (row) => {
   isEdit.value = true
   editId.value = row.id
+  const defaults = defaultForm()
+  const mergedRules = {
+    ...defaults.rules,
+    ...JSON.parse(JSON.stringify(row.rules)),
+    text_rules: { ...defaults.rules.text_rules, ...(row.rules?.text_rules || {}) },
+    image_rules: { ...defaults.rules.image_rules, ...(row.rules?.image_rules || {}) }
+  }
   Object.assign(strategyForm, {
     name: row.name,
     target_url: row.target_url,
-    rules: JSON.parse(JSON.stringify(row.rules)),
+    rules: mergedRules,
     Status: row.Status,
     Frequency: row.Frequency,
     creator_id: row.creator_id
@@ -306,8 +359,7 @@ const handleSubmit = async () => {
   submitLoading.value = true
   try {
     if (isEdit.value) {
-      // 使用数据代理服务更新策略（绕过后端 model_dump_json bug）
-      await api.put(`/data-api/strategies/${editId.value}`, strategyForm)
+      await updateStrategy(editId.value, strategyForm)
       ElMessage.success('更新成功')
     } else {
       await createStrategy(strategyForm)
@@ -335,7 +387,7 @@ const handleDelete = async (row) => {
     )
     // 级联删除：通过数据代理一次性删除策略及所有关联数据
     try {
-      await api.delete(`/data-api/strategy/${row.id}/cascade`)
+      await axios.delete(`/data-api/strategy/${row.id}/cascade`)
       ElMessage.success('删除成功（已清理所有关联数据）')
       loadStrategies()
       loadTasks()

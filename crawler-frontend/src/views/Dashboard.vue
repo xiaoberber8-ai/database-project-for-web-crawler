@@ -48,6 +48,60 @@
       </el-col>
     </el-row>
 
+    <!-- 当前任务指标 -->
+    <el-row :gutter="16" class="stat-row" style="margin-top: 16px;">
+      <el-col :span="24">
+        <el-card shadow="hover">
+          <template #header>
+            <div class="card-header">
+              <span>当前任务指标</span>
+              <el-tag v-if="crawlStatus.thread_alive" type="warning" effect="dark" size="small">
+                <el-icon style="vertical-align: middle;"><Loading /></el-icon>
+                实时更新中
+              </el-tag>
+              <el-tag v-else type="info" size="small">无运行中任务</el-tag>
+            </div>
+          </template>
+          <el-row :gutter="16">
+            <el-col :span="6">
+              <div class="current-stat" style="border-left: 4px solid #409EFF;">
+                <div class="current-stat-label">当前任务网页数</div>
+                <div class="current-stat-value">{{ currentTaskStats.webpages }}</div>
+              </div>
+            </el-col>
+            <el-col :span="6">
+              <div class="current-stat" style="border-left: 4px solid #67C23A;">
+                <div class="current-stat-label">当前任务文本数</div>
+                <div class="current-stat-value">{{ currentTaskStats.contents }}</div>
+              </div>
+            </el-col>
+            <el-col :span="6">
+              <div class="current-stat" style="border-left: 4px solid #E6A23C;">
+                <div class="current-stat-label">当前任务图片数</div>
+                <div class="current-stat-value">{{ currentTaskStats.images }}</div>
+              </div>
+            </el-col>
+            <el-col :span="6">
+              <div class="current-stat" style="border-left: 4px solid #F56C6C;">
+                <div class="current-stat-label">当前任务抓取条目</div>
+                <div class="current-stat-value">{{ currentTaskStats.items }}</div>
+              </div>
+            </el-col>
+          </el-row>
+          <el-row :gutter="16" style="margin-top: 12px;" v-if="crawlStatus.thread_alive && currentTask">
+            <el-col :span="24">
+              <el-descriptions :column="4" size="small" border>
+                <el-descriptions-item label="任务ID">{{ currentTask.id }}</el-descriptions-item>
+                <el-descriptions-item label="策略ID">{{ currentTask.strategy_id }}</el-descriptions-item>
+                <el-descriptions-item label="开始时间">{{ formatTime(currentTask.start_time) }}</el-descriptions-item>
+                <el-descriptions-item label="运行时长">{{ currentTaskDuration }}</el-descriptions-item>
+              </el-descriptions>
+            </el-col>
+          </el-row>
+        </el-card>
+      </el-col>
+    </el-row>
+
     <el-row :gutter="16" style="margin-top: 16px;">
       <!-- 最近任务 -->
       <el-col :span="14">
@@ -105,8 +159,9 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { getStrategies, getCrawlStatus, getTasks, getWebpages, getContents, getImages } from '../api'
+import { Loading } from '@element-plus/icons-vue'
 
 const stats = reactive({
   webpageCount: 0,
@@ -117,15 +172,34 @@ const stats = reactive({
 const recentTasks = ref([])
 const strategies = ref([])
 const crawlStatus = ref({ thread_alive: false, paused: false, stopped: false })
+const currentTask = ref(null)
+const currentTaskStats = reactive({
+  webpages: 0,
+  contents: 0,
+  images: 0,
+  items: 0
+})
+const now = ref(Date.now())
 let timer = null
+let statsTimer = null
 
 const formatTime = (t) => {
   if (!t) return '-'
   return new Date(t).toLocaleString('zh-CN')
 }
 
-const statusType = (s) => ({ running: 'warning', completed: 'success', pending: 'info', failed: 'danger' }[s] || 'info')
-const statusText = (s) => ({ running: '运行中', completed: '已完成', pending: '等待中', failed: '失败' }[s] || s)
+// 运行时长计算
+const currentTaskDuration = computed(() => {
+  if (!currentTask.value?.start_time) return '-'
+  const start = new Date(currentTask.value.start_time).getTime()
+  const diff = Math.floor((now.value - start) / 1000)
+  if (diff < 60) return `${diff}秒`
+  if (diff < 3600) return `${Math.floor(diff / 60)}分${diff % 60}秒`
+  return `${Math.floor(diff / 3600)}时${Math.floor((diff % 3600) / 60)}分`
+})
+
+const statusType = (s) => ({ running: 'warning', completed: 'success', pending: 'info', failed: 'danger', cancelled: 'info', interrupted: 'danger' }[s] || 'info')
+const statusText = (s) => ({ running: '运行中', completed: '已完成', pending: '等待中', failed: '失败', cancelled: '已取消', interrupted: '已中断' }[s] || s)
 
 // 修正任务状态：如果任务记录是running但线程已死，则显示为"已结束"
 const getTaskStatus = (task) => {
@@ -150,24 +224,58 @@ const loadStats = async () => {
     stats.imageCount = images.length
     stats.taskCount = tasks.length
     recentTasks.value = tasks.slice(0, 5)
+
+    // 查找当前运行中的任务
+    const running = tasks.find(t => t.Status === 'running')
+    if (running && crawlStatus.value.thread_alive) {
+      currentTask.value = running
+      // 统计当前任务的数据量
+      const taskId = running.id
+      // content 和 image 表没有 task_id 字段，需要通过 webpage_id 关联
+      const taskWebpageIds = new Set(
+        webpages.filter(w => w.task_id === taskId).map(w => w.id)
+      )
+      currentTaskStats.webpages = taskWebpageIds.size
+      currentTaskStats.contents = contents.filter(c => taskWebpageIds.has(c.webpage_id)).length
+      currentTaskStats.images = images.filter(i => taskWebpageIds.has(i.webpage_id)).length
+      currentTaskStats.items = running.item_count || 0
+    } else {
+      currentTask.value = null
+      currentTaskStats.webpages = 0
+      currentTaskStats.contents = 0
+      currentTaskStats.images = 0
+      currentTaskStats.items = 0
+    }
   } catch {}
 }
 
 const refreshStatus = async () => {
-  try { crawlStatus.value = await getCrawlStatus() } catch {}
+  try {
+    crawlStatus.value = await getCrawlStatus()
+    // 爬虫运行时同时刷新统计数据
+    if (crawlStatus.value.thread_alive) {
+      await loadStats()
+    }
+  } catch {}
 }
 
 onMounted(async () => {
   try { strategies.value = await getStrategies() } catch {}
   loadStats()
   refreshStatus()
+  // 每3秒刷新爬虫状态和统计数据
   timer = setInterval(() => {
     refreshStatus()
-  }, 5000)
+  }, 3000)
+  // 每1秒更新运行时长
+  statsTimer = setInterval(() => {
+    now.value = Date.now()
+  }, 1000)
 })
 
 onUnmounted(() => {
   if (timer) clearInterval(timer)
+  if (statsTimer) clearInterval(statsTimer)
 })
 </script>
 
@@ -237,6 +345,21 @@ onUnmounted(() => {
 }
 .strategy-name {
   font-size: 14px;
+  color: #303133;
+}
+.current-stat {
+  padding: 12px 16px;
+  background: #f5f7fa;
+  border-radius: 4px;
+}
+.current-stat-label {
+  font-size: 13px;
+  color: #909399;
+  margin-bottom: 4px;
+}
+.current-stat-value {
+  font-size: 24px;
+  font-weight: bold;
   color: #303133;
 }
 </style>

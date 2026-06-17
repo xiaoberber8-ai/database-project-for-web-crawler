@@ -1,4 +1,3 @@
-把crawler文件中的数据库设计改成：
 # =========================
 # 数据库模型 (完整关联版)
 # =========================
@@ -121,10 +120,6 @@ class Image(Base):
 Base.metadata.create_all(engine)
 
 
-
-
-
-以下为main文件代码：
 import io
 import csv
 import re
