@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
+import hmac
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,7 +25,8 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
-
+from io import BytesIO
+from PIL import Image as PILImage
 
 # =========================
 # 配置
@@ -44,7 +46,7 @@ DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 # =========================
-# 数据库模型
+# 数据库模型 (完整关联版)
 # =========================
 
 class Admin(Base):
@@ -52,6 +54,9 @@ class Admin(Base):
     id = Column(Integer, primary_key=True)
     Username = Column(String(100), unique=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
+    
+    # 关联：管理员创建的策略
+    strategies = relationship("CrawlerStrategy", back_populates="creator")
 
 
 class CrawlerStrategy(Base):
@@ -66,7 +71,9 @@ class CrawlerStrategy(Base):
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
-    creator = relationship("Admin", lazy="joined")
+    # 关联：双向绑定创建者与任务记录
+    creator = relationship("Admin", back_populates="strategies", lazy="joined")
+    tasks = relationship("TaskRecord", back_populates="strategy")
 
 
 class TaskRecord(Base):
@@ -79,7 +86,9 @@ class TaskRecord(Base):
     item_count = Column(Integer, default=0)
     error_message = Column(Text)
 
-    strategy = relationship("CrawlerStrategy", lazy="joined")
+    # 关联：所属策略，以及该任务下抓取到的所有网页
+    strategy = relationship("CrawlerStrategy", back_populates="tasks", lazy="joined")
+    webpages = relationship("WebPage", back_populates="task")
 
 
 class Website(Base):
@@ -89,6 +98,9 @@ class Website(Base):
     name = Column(String(255), nullable=False)
     company_info = Column(Text)
     contact_info = Column(Text)
+
+    # 关联：该网站下包含的所有网页 records
+    webpages = relationship("WebPage", back_populates="website")
 
 
 class WebPage(Base):
@@ -108,12 +120,21 @@ class WebPage(Base):
         UniqueConstraint("website_id", "url_hash", name="uq_webpage_website_urlhash"),
     )
 
+    # 核心枢纽关联：向上连网站和任务，向下连内容和图片
+    website = relationship("Website", back_populates="webpages")
+    task = relationship("TaskRecord", back_populates="webpages")
+    contents = relationship("Content", back_populates="webpage")
+    images = relationship("Image", back_populates="webpage")
+
 
 class DataSource(Base):
     __tablename__ = "datasource"
     id = Column(Integer, primary_key=True)
     publisher_name = Column(String(255))
     origin_url = Column(Text)
+
+    # 关联：发布在这个平台上的所有内容记录
+    contents = relationship("Content", back_populates="datasource")
 
 
 class Content(Base):
@@ -126,6 +147,10 @@ class Content(Base):
     publish_time = Column(DateTime)
     keywords = Column(Text)
 
+    # 关联：所属的网页主体，以及对应的数据源
+    webpage = relationship("WebPage", back_populates="contents")
+    datasource = relationship("DataSource", back_populates="contents")
+
 
 class Image(Base):
     __tablename__ = "image"
@@ -135,6 +160,16 @@ class Image(Base):
     local_path = Column(Text)
     description = Column(Text)
 
+    # 关联：图片所在的网页
+    webpage = relationship("WebPage", back_populates="images")
+
+
+class SystemSetting(Base):
+    __tablename__ = "system_setting"
+    id = Column(Integer, primary_key=True)
+    setting_key = Column(String(100), unique=True, nullable=False, index=True)
+    setting_value = Column(Text, nullable=False)
+    description = Column(String(255))
 
 Base.metadata.create_all(engine)
 
@@ -146,12 +181,56 @@ Base.metadata.create_all(engine)
 class TextRules(BaseModel):
     title_selector: str = "title"
     body_selector: str = "body"
+    company_selector: Optional[str] = None
+    contact_selector: Optional[str] = None
+    # 👇 新增：发布者/数据源选择器
+    source_selector: Optional[str] = Field(default=None, description="发布者CSS选择器，如 '.author' 或 '#source'")
 
-
-class ImageRules(BaseModel):
+class ImageRules(BaseModel):     #这是修改部分，有关图片过滤器
+    # 图片选择器
     image_selector: str = "img"
+
+    # 是否下载图片
     download_images: bool = True
+
+    # 图片保存目录
     image_dir: str = "./images"
+
+    # 图片容器选择器：为空则回退正文区域
+    image_container_selector: Optional[str] = None
+
+    # 最小宽度，小于该宽度的图片忽略
+    min_width: int = 150
+
+    # 最小高度，小于该高度的图片忽略
+    min_height: int = 150
+
+    # 最小图片面积（可选）
+    min_area: int = 30000
+
+    # 最大宽高比，过滤超长广告图
+    max_ratio: float = 5.0
+
+    # 过滤广告/图标关键词
+    exclude_keywords: list[str] = [
+        "ad",
+        "ads",
+        "advert",
+        "banner",
+        "logo",
+        "icon",
+        "sprite",
+        "avatar",
+        "share",
+        "wechat",
+        "wx",
+        "tracking",
+        "pixel",
+        "recommend"
+    ]
+
+    # 是否只抓正文区域图片
+    only_article_images: bool = True
 
 
 class StrategyRules(BaseModel):
@@ -163,6 +242,8 @@ class StrategyRules(BaseModel):
     headers: Dict[str, Any] = Field(default_factory=lambda: dict(DEFAULT_HEADERS))
     timeout: int = 15
     rate_limit: float = 1.0
+# 新增字段：控制重复数据的处理方式，默认跳过
+    duplicate_action: str = Field(default="skip", description="遇到重复数据时: skip(跳过) 或 overwrite(覆盖)")
 
 
 class StrategyCreate(BaseModel):
@@ -258,6 +339,24 @@ def parse_strategy_rules(strategy: CrawlerStrategy) -> StrategyRules:
     return StrategyRules.model_validate(json.loads(strategy.rules_json))
 
 
+
+# 实际开发中可将其移至环境变量，这里作为学术项目演示使用静态盐
+SECRET_SALT = b"crawler_project_secure_salt_2026"
+
+def hash_password(password: str) -> str:
+    """使用 SHA256 对密码进行加盐哈希"""
+    return hmac.new(SECRET_SALT, password.encode('utf-8'), hashlib.sha256).hexdigest()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """验证明文密码与哈希值是否匹配"""
+    return hmac.compare_digest(hash_password(plain_password), hashed_password)
+
+# 简易的内存 Token 校验器（用于演示，后续可升级为标准的 JWT 库）
+def generate_simple_token(username: str) -> str:
+    timestamp = str(int(time.time()))
+    payload = f"{username}:{timestamp}"
+    signature = hmac.new(SECRET_SALT, payload.encode('utf-8'), hashlib.sha256).hexdigest()
+    return f"{payload}:{signature}"
 # =========================
 # 策略服务
 # =========================
@@ -327,18 +426,40 @@ class StrategyService:
 
 @dataclass
 class CrawlRule:
-    depth: int = 1
-    allowed_domains: List[str] = None
-    start_urls: List[str] = None
-    title_selector: str = "title"
-    body_selector: str = "body"
-    image_selector: str = "img"
+    depth: int
+
+    allowed_domains: List[str]
+    start_urls: List[str]
+
+    title_selector: str
+    body_selector: str
+
+    company_selector: str
+    contact_selector: str
+    source_selector: str
+
+    image_selector: str
+    download_images: bool
+    image_dir: str
+
+    image_container_selector: Optional[str]
+
+    min_width: int
+    min_height: int
+    min_area: int
+    max_ratio: float
+
+    exclude_keywords: List[str]
+
+    headers: Dict[str, Any]
+
+    timeout: int
+    rate_limit: float
+
+    duplicate_action: str
+
+    # 链接提取规则
     link_selector: str = "a[href]"
-    download_images: bool = True
-    image_dir: str = "./images"
-    headers: Dict[str, Any] = None
-    timeout: int = 15
-    rate_limit: float = 1.0
 
 
 class CrawlerExecutor:
@@ -588,16 +709,41 @@ class CrawlerExecutor:
 
             rule = CrawlRule(
                 depth=rules.depth,
+
                 allowed_domains=allowed_domains,
                 start_urls=start_urls,
+
+                # 文本提取规则
                 title_selector=rules.text_rules.title_selector,
                 body_selector=rules.text_rules.body_selector,
+
+                # 图片规则
                 image_selector=rules.image_rules.image_selector,
                 download_images=rules.image_rules.download_images,
                 image_dir=rules.image_rules.image_dir,
+
+                # 图片正文区域
+                image_container_selector=rules.image_rules.image_container_selector,
+
+                # 图片过滤参数
+                min_width=rules.image_rules.min_width,
+                min_height=rules.image_rules.min_height,
+                min_area=rules.image_rules.min_area,
+                max_ratio=rules.image_rules.max_ratio,
+                exclude_keywords=rules.image_rules.exclude_keywords,
+
+                # 请求参数
                 headers=rules.headers or dict(DEFAULT_HEADERS),
                 timeout=rules.timeout,
                 rate_limit=rules.rate_limit,
+
+                # 去重策略
+                duplicate_action=rules.duplicate_action,
+
+                # 网站信息提取规则
+                company_selector=rules.text_rules.company_selector,
+                contact_selector=rules.text_rules.contact_selector,
+                source_selector=rules.text_rules.source_selector,
             )
 
             ensure_dir(rule.image_dir)
@@ -624,7 +770,17 @@ class CrawlerExecutor:
                     if not any(current_domain.endswith(d) for d in rule.allowed_domains):
                         continue
 
-                page = self._save_webpage_record(db, website.id, task.id, url, url_hash)
+                page, should_fetch = self._save_webpage_record(db, website.id, task.id, url, url_hash, rule.duplicate_action)
+                
+                if not should_fetch:
+                    # 触发跳过规则：不发请求，直接处理队列里的下一个 URL
+                    continue
+
+                # 如果是覆盖模式，为了防止后续插入 Content 时触发 UniqueConstraint 报错，先清空旧关联数据
+                if rule.duplicate_action == "overwrite":
+                    db.query(Content).filter(Content.webpage_id == page.id).delete()
+                    db.query(Image).filter(Image.webpage_id == page.id).delete()
+                    db.commit()
 
                 try:
                     resp = self.session.get(url, headers=rule.headers, timeout=rule.timeout)
@@ -645,8 +801,16 @@ class CrawlerExecutor:
                     text_body = self._extract_text(soup, rule)
                     keywords = self._extract_keywords(soup)
                     publish_time = self._extract_publish_time(soup, html)
-
-                    datasource = self._get_or_create_datasource(db, url)
+                    # 新增核心：提取公司和联系方式，并动态补全 Website 表中的空白元数据
+                    company_info = self._extract_company(soup, rule)
+                    contact_info = self._extract_contact(soup, rule)
+                    if company_info and not website.company_info:
+                        website.company_info = company_info
+                    if contact_info and not website.contact_info:
+                        website.contact_info = contact_info
+                    # 每次抽取到新内容时如果发现网站元数据为空，就会自动帮其在数据库中补全
+                    
+                    datasource = self._get_or_create_datasource(db, url, soup, rule)
 
                     content = Content(
                         webpage_id=page.id,
@@ -665,7 +829,7 @@ class CrawlerExecutor:
                             soup=soup,
                             base_url=url,
                             webpage_id=page.id,
-                            image_dir=rule.image_dir,
+                            rule=rule,
                             headers=rule.headers,
                             timeout=rule.timeout,
                         )
@@ -700,35 +864,71 @@ class CrawlerExecutor:
         finally:
             db.close()
 
-    def _save_webpage_record(self, db: Session, website_id: int, task_id: int, url: str, url_hash: str) -> WebPage:
-        page = WebPage(
-            website_id=website_id,
-            task_id=task_id,
-            url=url,
-            url_hash=url_hash,
-            fetch_time=None,
-            http_status=None,
-            process_status="fetching",
-            page_type="unknown",
-        )
-        db.add(page)
-        db.commit()
-        db.refresh(page)
-        return page
+    def _save_webpage_record(self, db: Session, website_id: int, task_id: int, url: str, url_hash: str, duplicate_action: str) -> tuple[WebPage, bool]:
+            # 1. 先查询数据库中是否已有该网页
+            existing_page = db.query(WebPage).filter(
+                WebPage.website_id == website_id,
+                WebPage.url_hash == url_hash
+            ).first()
 
-    def _get_or_create_datasource(self, db: Session, origin_url: str) -> DataSource:
-        parsed = urlparse(origin_url)
-        publisher_name = parsed.netloc
+            if existing_page:
+                if duplicate_action == "skip":
+                    # 策略为跳过：直接返回已存在的页面对象，并告诉外层不需要再次抓取 (False)
+                    return existing_page, False
+                
+                # 策略为覆盖 (overwrite)：更新所属任务并重置状态，告诉外层需要抓取 (True)
+                existing_page.task_id = task_id
+                existing_page.process_status = "fetching"
+                db.commit()
+                db.refresh(existing_page)
+                return existing_page, True
 
-        ds = db.query(DataSource).filter(DataSource.origin_url == origin_url).first()
-        if ds:
+            # 2. 如果不存在，正常创建新记录并告诉外层需要抓取 (True)
+            page = WebPage(
+                website_id=website_id,
+                task_id=task_id,
+                url=url,
+                url_hash=url_hash,
+                fetch_time=None,
+                http_status=None,
+                process_status="fetching",
+                page_type="unknown",
+            )
+            db.add(page)
+            db.commit()
+            db.refresh(page)
+            return page, True
+
+    def _get_or_create_datasource(self, db: Session, origin_url: str, soup: BeautifulSoup, rule: CrawlRule) -> DataSource:
+            publisher_name = None
+            
+            # 1. 优先尝试通过 CSS 选择器精准提取真实发布来源
+            if rule.source_selector:
+                node = soup.select_one(rule.source_selector)
+                if node:
+                    # 清洗掉常见的“来源：”等前缀字样
+                    raw_text = node.get_text(" ", strip=True)
+                    publisher_name = re.sub(r"^(来源|作者|发布者)[:：\s]*", "", raw_text).strip()
+            
+            # 2. 如果没提取到，使用域名作为兜底
+            if not publisher_name:
+                parsed = urlparse(origin_url)
+                publisher_name = parsed.netloc
+
+            # 3. 查库或新建
+            ds = db.query(DataSource).filter(DataSource.publisher_name == publisher_name).first()
+            if ds:
+                # 如果原始链接为空，可以顺便补充一下
+                if not ds.origin_url:
+                    ds.origin_url = origin_url
+                    db.commit()
+                return ds
+
+            ds = DataSource(publisher_name=publisher_name, origin_url=origin_url)
+            db.add(ds)
+            db.commit()
+            db.refresh(ds)
             return ds
-
-        ds = DataSource(publisher_name=publisher_name, origin_url=origin_url)
-        db.add(ds)
-        db.commit()
-        db.refresh(ds)
-        return ds
 
     def _extract_title(self, soup: BeautifulSoup, rule: CrawlRule) -> str:
         node = soup.select_one(rule.title_selector)
@@ -748,6 +948,18 @@ class CrawlerExecutor:
             return meta["content"]
         return ""
 
+    def _extract_company(self, soup: BeautifulSoup, rule: CrawlRule) -> Optional[str]:
+        if not rule.company_selector:
+            return None
+        node = soup.select_one(rule.company_selector)
+        return node.get_text(" ", strip=True) if node else None
+
+    def _extract_contact(self, soup: BeautifulSoup, rule: CrawlRule) -> Optional[str]:
+        if not rule.contact_selector:
+            return None
+        node = soup.select_one(rule.contact_selector)
+        return node.get_text(" ", strip=True) if node else None
+
     def _extract_links(self, soup: BeautifulSoup, base_url: str, selector: str):
         links = set()
         for a in soup.select(selector):
@@ -760,51 +972,149 @@ class CrawlerExecutor:
         return list(links)
 
     def _extract_and_save_images(
-        self,
-        db: Session,
-        soup: BeautifulSoup,
-        base_url: str,
-        webpage_id: int,
-        image_dir: str,
-        headers: Dict[str, Any],
-        timeout: int,
+            self,
+            db: Session,
+            soup: BeautifulSoup,
+            base_url: str,
+            webpage_id: int,
+            rule: CrawlRule,
+            headers: Dict[str, Any],
+            timeout: int,
     ) -> int:
+        """
+        只抓正文区域中更像“内容配图”的图片：
+        1. 优先限制在正文/图片容器内
+        2. 过滤广告、logo、icon、小图标、分享图等噪声图片
+        3. 支持 src / data-src / data-original / srcset
+        4. 按最小宽高、最小面积、最大宽高比过滤
+        """
         count = 0
-        for img in soup.select("img"):
-            src = img.get("src") or img.get("data-src") or img.get("data-original")
-            if not src:
+
+        container = None
+        if getattr(rule, "image_container_selector", None):
+            container = soup.select_one(rule.image_container_selector)
+        if not container:
+            container = soup.select_one(rule.body_selector) if rule.body_selector else None
+        if not container:
+            container = soup.body or soup
+
+        image_candidates = container.select(rule.image_selector or "img")
+        for img in image_candidates:
+            img_url = self._get_best_image_url(img, base_url)
+            if not img_url:
                 continue
 
-            img_url = normalize_url(base_url, src)
-            desc = img.get("alt", "")
-            local_path = ""
+            if self._is_noise_image(img, img_url, rule):
+                continue
+
+            desc = img.get("alt", "") or ""
 
             try:
                 r = self.session.get(img_url, headers=headers, timeout=timeout, stream=True)
-                if r.status_code == 200:
-                    ext = os.path.splitext(urlparse(img_url).path)[1]
-                    if not ext or len(ext) > 5:
-                        ext = ".jpg"
-                    filename = safe_filename(img_url) + ext
-                    local_path = os.path.join(image_dir, filename)
-                    with open(local_path, "wb") as f:
-                        for chunk in r.iter_content(8192):
-                            if chunk:
-                                f.write(chunk)
-            except Exception:
-                pass
+                if r.status_code != 200:
+                    continue
 
-            image_record = Image(
-                webpage_id=webpage_id,
-                image_url=img_url,
-                local_path=local_path,
-                description=desc,
-            )
-            db.add(image_record)
-            count += 1
+                content_type = r.headers.get("Content-Type", "").lower()
+                if not any(x in content_type for x in ("image/", "application/octet-stream")):
+                    continue
+
+                # 先用 PIL 判断图片尺寸，过滤小图、横幅图、异常比例图
+                try:
+                    pil_img = PILImage.open(BytesIO(r.content))
+                    width, height = pil_img.size
+
+                    min_width = getattr(rule, "min_width", 150)
+                    min_height = getattr(rule, "min_height", 150)
+                    min_area = getattr(rule, "min_area", 30000)
+                    max_ratio = getattr(rule, "max_ratio", 5.0)
+
+                    if width < min_width or height < min_height:
+                        continue
+
+                    if width * height < min_area:
+                        continue
+
+                    ratio = max(width / max(height, 1), height / max(width, 1))
+                    if ratio > max_ratio:
+                        continue
+
+                except Exception:
+                    # 无法识别图片尺寸，直接跳过
+                    continue
+
+                ext = os.path.splitext(urlparse(img_url).path)[1]
+                if not ext or len(ext) > 5:
+                    ext = ".jpg"
+
+                filename = safe_filename(img_url) + ext
+                local_path = os.path.join(rule.image_dir, filename)
+
+                with open(local_path, "wb") as f:
+                    f.write(r.content)
+
+                image_record = Image(
+                    webpage_id=webpage_id,
+                    image_url=img_url,
+                    local_path=local_path,
+                    description=desc,
+                )
+                db.add(image_record)
+                count += 1
+
+            except Exception:
+                continue
 
         return count
 
+    def _get_best_image_url(self, img, base_url: str) -> str:
+        """
+        从 img 标签中优先提取更像原图的地址：
+        data-original > data-src > src > srcset
+        """
+        for attr in ("data-original", "data-src", "src"):
+            src = img.get(attr)
+            if src:
+                return normalize_url(base_url, src)
+
+        srcset = img.get("srcset")
+        if srcset:
+            parts = [p.strip() for p in srcset.split(",") if p.strip()]
+            if parts:
+                last = parts[-1].split()[0]
+                return normalize_url(base_url, last)
+
+        return ""
+
+    def _is_noise_image(self, img, img_url: str, rule: CrawlRule) -> bool:
+        """
+        过滤广告图、logo、icon、小图标、分享图等与正文关系较小的内容。
+        """
+        default_keywords = [
+            "ad", "ads", "advert", "advertisement",
+            "logo", "icon", "sprite", "banner",
+            "avatar", "share", "wechat", "wx",
+            "tracking", "pixel", "related", "recommend",
+            "sponsor", "promo", "button", "footer", "header"
+        ]
+
+        exclude_keywords = getattr(rule, "exclude_keywords", None) or default_keywords
+
+        fields = [
+            str(img.get("alt", "")),
+            " ".join(img.get("class", [])) if img.get("class") else "",
+            str(img.get("id", "")),
+            str(img.get("title", "")),
+            img_url or ""
+        ]
+        text = " ".join(fields).lower()
+
+        if any(k.lower() in text for k in exclude_keywords):
+            return True
+
+        if any(x in img_url.lower() for x in ("pixel", "track", "counter")):
+            return True
+
+        return False
 
 # =========================
 # FastAPI
