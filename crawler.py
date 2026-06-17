@@ -480,7 +480,7 @@ if __name__ == "__main__":
         #显然在数据库里没有strategy时会报错，留待以后修改
         rules = {
             "depth": 1,
-            "allowed_domains": ["news.sina.com.cn"],    //修改下面3行的网址能爬不同网站
+            "allowed_domains": ["news.sina.com.cn"],    # 修改下面3行的网址能爬不同网站
             "start_urls": ["http://news.sina.com.cn"],
             "text_rules": {
                 "title_selector": "h1",
