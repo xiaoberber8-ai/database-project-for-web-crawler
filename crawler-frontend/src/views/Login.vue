@@ -2,9 +2,11 @@
   <div class="login-container">
     <div class="login-card">
       <div class="login-header">
-        <el-icon :size="48" color="#409EFF"><Monitor /></el-icon>
-        <h2>爬虫数据管理系统</h2>
-        <p>Web Crawler Data Management System</p>
+        <img :src="logoUrl" alt="SpideX Logo" class="login-logo" />
+        <div class="login-title">
+          <h2>SpideX</h2>
+          <span class="login-subtitle">爬虫数据库管理系统</span>
+        </div>
       </div>
       <el-form ref="formRef" :model="form" :rules="rules" label-width="0" size="large">
         <el-form-item prop="username">
@@ -25,6 +27,7 @@
 import { ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import logoUrl from '../assets/spidex-logo.png'
 
 const router = useRouter()
 const formRef = ref(null)
@@ -80,9 +83,29 @@ const handleLogin = async () => {
   text-align: center;
   margin-bottom: 30px;
 }
+.login-logo {
+  width: 96px;
+  height: 96px;
+  object-fit: contain;
+  margin: 0 auto 12px;
+  display: block;
+}
+.login-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+}
 .login-header h2 {
-  margin: 12px 0 4px;
+  margin: 0;
   color: #303133;
+  font-size: 30px;
+  font-weight: bold;
+  letter-spacing: 1px;
+}
+.login-subtitle {
+  color: #909399;
+  font-size: 13px;
 }
 .login-header p {
   color: #909399;

@@ -14,6 +14,9 @@
         <el-form-item label="任务ID">
           <el-input v-model="searchForm.taskId" placeholder="输入任务ID" clearable style="width: 120px;" />
         </el-form-item>
+        <el-form-item label="策略ID">
+          <el-input v-model="searchForm.strategyId" placeholder="输入策略ID" clearable style="width: 120px;" />
+        </el-form-item>
         <el-form-item label="时间范围">
           <el-date-picker
             v-model="searchForm.dateRange"
@@ -44,7 +47,8 @@
         </div>
       </template>
       <el-table :data="paginatedResults" stripe style="width: 100%">
-        <el-table-column prop="id" label="ID" width="60" />
+        <el-table-column prop="id" label="内容ID" width="70" />
+        <el-table-column prop="strategy_id" label="策略ID" width="70" />
         <el-table-column prop="Title" label="标题" width="250" show-overflow-tooltip>
           <template #default="{ row }">
             <span v-html="highlightKeyword(row.Title)"></span>
@@ -55,8 +59,21 @@
             <span v-html="highlightKeyword(getPreview(row.text_body))"></span>
           </template>
         </el-table-column>
-        <el-table-column prop="Publisher" label="发布者" width="120" show-overflow-tooltip />
-        <el-table-column prop="Publish_Date" label="发布时间" width="120" show-overflow-tooltip />
+        <el-table-column prop="Publisher" label="发布者" width="120" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ row.Publisher || '-' }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="publish_time" label="发布时间" width="160" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ formatTime(row.publish_time) }}
+          </template>
+        </el-table-column>
+        <el-table-column prop="crawl_time" label="爬取时间" width="160" show-overflow-tooltip>
+          <template #default="{ row }">
+            {{ formatTime(row.crawl_time) }}
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="100" fixed="right">
           <template #default="{ row }">
             <el-button size="small" :icon="View" @click="viewContent(row)">查看</el-button>
@@ -76,9 +93,11 @@
     <el-dialog v-model="contentDialogVisible" :title="currentContent.Title || '内容详情'" width="800px" top="5vh">
       <div class="content-detail">
         <h3 v-html="highlightKeyword(currentContent.Title)"></h3>
-        <div class="content-meta" v-if="currentContent.Publisher || currentContent.Publish_Date">
-          <el-tag v-if="currentContent.Publisher" size="small">{{ currentContent.Publisher }}</el-tag>
-          <el-tag v-if="currentContent.Publish_Date" size="small" type="info">{{ currentContent.Publish_Date }}</el-tag>
+        <div class="content-meta" v-if="currentContent.Publisher || currentContent.publish_time">
+          <el-tag v-if="currentContent.Publisher" size="small">发布者: {{ currentContent.Publisher }}</el-tag>
+          <el-tag v-if="currentContent.publish_time" size="small" type="info">发布: {{ formatTime(currentContent.publish_time) }}</el-tag>
+          <el-tag v-if="currentContent.crawl_time" size="small" type="success">爬取: {{ formatTime(currentContent.crawl_time) }}</el-tag>
+          <el-tag v-if="currentContent.strategy_id" size="small" type="warning">策略ID: {{ currentContent.strategy_id }}</el-tag>
         </div>
         <el-divider />
 
@@ -153,13 +172,14 @@ const searchForm = ref({
   keyword: '',
   publisher: '',
   taskId: '',
+  strategyId: '',
   dateRange: null,
   domain: ''
 })
 
 const filteredContents = computed(() => {
   let results = allContents.value
-  const { keyword, publisher, taskId, dateRange, domain } = searchForm.value
+  const { keyword, publisher, taskId, strategyId, dateRange, domain } = searchForm.value
 
   if (keyword) {
     const kw = keyword.toLowerCase()
@@ -184,11 +204,20 @@ const filteredContents = computed(() => {
     }
   }
 
+  if (strategyId) {
+    const sid = parseInt(strategyId, 10)
+    if (!isNaN(sid)) {
+      // /contents 接口已通过 JOIN 返回 strategy_id，直接筛选
+      results = results.filter(c => c.strategy_id === sid)
+    }
+  }
+
   if (dateRange && dateRange.length === 2) {
     const [start, end] = dateRange
     results = results.filter(c => {
-      if (!c.Publish_Date) return false
-      return c.Publish_Date >= start && c.Publish_Date <= end
+      if (!c.publish_time) return false
+      const pt = c.publish_time.substring(0, 10)
+      return pt >= start && pt <= end
     })
   }
 
@@ -213,6 +242,11 @@ const getPreview = (text) => {
   return text.substring(0, 200)
 }
 
+const formatTime = (t) => {
+  if (!t) return '-'
+  return new Date(t).toLocaleString('zh-CN')
+}
+
 const highlightKeyword = (text) => {
   if (!text || !searchForm.value.keyword) return text
   const kw = searchForm.value.keyword
@@ -228,16 +262,21 @@ const handleSearch = () => {
 }
 
 const handleReset = () => {
-  searchForm.value = { keyword: '', publisher: '', taskId: '', dateRange: null, domain: '' }
+  searchForm.value = { keyword: '', publisher: '', taskId: '', strategyId: '', dateRange: null, domain: '' }
   searched.value = false
 }
 
-// 解析图片URL：优先使用本地路径（若可访问），否则使用远程URL
+// 解析图片URL：优先使用本地静态文件（避免远程防盗链），否则回退到远程URL
 const resolveImageUrl = (img) => {
   if (!img) return ''
-  // local_path 是服务器路径，前端无法直接访问，优先使用 image_url
+  // 优先使用本地下载的图片，通过后端静态文件服务访问
+  if (img.local_path) {
+    // 提取文件名，拼接成 /images/xxx.jpg 的形式
+    const filename = img.local_path.split(/[\\/]/).pop()
+    if (filename) return `/images/${filename}`
+  }
+  // 回退到远程 URL（可能受防盗链限制）
   if (img.image_url) return img.image_url
-  if (img.local_path) return img.local_path
   return ''
 }
 

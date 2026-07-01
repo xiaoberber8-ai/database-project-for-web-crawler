@@ -2,8 +2,8 @@
   <el-container class="layout-container">
     <el-aside :width="isCollapse ? '64px' : '220px'" class="aside">
       <div class="logo">
-        <el-icon :size="28" color="#fff"><Monitor /></el-icon>
-        <span v-show="!isCollapse" class="logo-text">爬虫管理系统</span>
+        <img :src="logoUrl" alt="SpideX" class="logo-img" />
+        <span v-show="!isCollapse" class="logo-text">SpideX</span>
       </div>
       <el-menu
         :default-active="route.path"
@@ -61,6 +61,7 @@
 <script setup>
 import { ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import logoUrl from '../assets/spidex-logo.png'
 
 const route = useRoute()
 const router = useRouter()
@@ -93,10 +94,16 @@ const handleCommand = (cmd) => {
   gap: 8px;
   border-bottom: 1px solid rgba(255,255,255,0.1);
 }
+.logo-img {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+}
 .logo-text {
   color: #fff;
-  font-size: 16px;
+  font-size: 18px;
   font-weight: bold;
+  letter-spacing: 1px;
   white-space: nowrap;
 }
 .header {

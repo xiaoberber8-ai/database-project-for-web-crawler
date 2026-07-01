@@ -1,0 +1,43 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# ===== Node.js =====
+node_modules/
+crawler-frontend/node_modules/
+crawler-frontend/dist/
+
+# ===== 爬取数据（不应上传到 GitHub）=====
+爬虫数据库系统/images/
+*.log
+crawler.log
+
+# ===== 环境配置 =====
+.env
+.env.local
+*.local
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== 操作系统 =====
+.DS_Store
+Thumbs.db
+
+# ===== 数据库 =====
+*.db
+*.sqlite3
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+*.cache

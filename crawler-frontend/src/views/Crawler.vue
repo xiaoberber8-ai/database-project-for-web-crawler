@@ -79,6 +79,11 @@
         <el-table-column prop="id" label="ID" width="60" />
         <el-table-column prop="name" label="策略名称" width="160" />
         <el-table-column prop="target_url" label="目标URL" min-width="200" show-overflow-tooltip />
+        <el-table-column label="类型" width="100">
+          <template #default="{ row }">
+            <el-tag :type="strategyTypeTag(row)" size="small">{{ strategyTypeLabel(row) }}</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="Status" label="状态" width="100">
           <template #default="{ row }">
             <el-tag :type="row.Status === 'enabled' ? 'success' : 'info'">{{ row.Status === 'enabled' ? '启用' : '禁用' }}</el-tag>
@@ -125,7 +130,44 @@
       </el-table>
     </el-card>
 
-    <!-- 创建/编辑策略对话框 -->
+    <!-- 策略类型选择对话框 -->
+    <el-dialog v-model="typeDialogVisible" title="选择策略类型" width="680px" :close-on-click-modal="false">
+      <div class="strategy-type-cards">
+        <div class="type-card" @click="selectType('baby')">
+          <div class="type-icon" style="background: #fef3c7; color: #92400e;">
+            <el-icon :size="36"><Sunny /></el-icon>
+          </div>
+          <div class="type-title">宝宝策略</div>
+          <div class="type-desc">只需输入网址 URL，其余参数全部使用默认值（爬取深度=1），一键开始爬取。适合快速抓取单个页面。</div>
+        </div>
+        <div class="type-card" @click="selectType('professional')">
+          <div class="type-icon" style="background: #dbeafe; color: #1e40af;">
+            <el-icon :size="36"><Setting /></el-icon>
+          </div>
+          <div class="type-title">专业模式</div>
+          <div class="type-desc">完整配置爬取深度、选择器、图片规则、请求参数等所有选项。适合有经验的高级用户精确控制爬虫行为。</div>
+        </div>
+      </div>
+    </el-dialog>
+
+    <!-- 宝宝策略对话框 -->
+    <el-dialog v-model="babyDialogVisible" title="宝宝策略 - 快速爬取" width="500px" destroy-on-close>
+      <el-form ref="babyFormRef" :model="babyForm" :rules="babyRules" label-width="100px">
+        <el-form-item label="策略名称" prop="name">
+          <el-input v-model="babyForm.name" placeholder="如：快速爬取测试" />
+        </el-form-item>
+        <el-form-item label="目标网址" prop="target_url">
+          <el-input v-model="babyForm.target_url" placeholder="如：https://example.com/page" />
+        </el-form-item>
+      </el-form>
+      <el-alert title="宝宝策略将使用默认参数：爬取深度=1，不下载图片，仅抓取当前页面文本内容" type="info" :closable="false" style="margin-bottom: 12px;" />
+      <template #footer>
+        <el-button @click="babyDialogVisible = false">取消</el-button>
+        <el-button type="warning" :loading="submitLoading" @click="handleBabySubmit">创建并爬取</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 创建/编辑策略对话框（专业模式） -->
     <el-dialog v-model="dialogVisible" :title="isEdit ? '编辑策略' : '新建策略'" width="700px" destroy-on-close>
       <el-form ref="strategyFormRef" :model="strategyForm" :rules="strategyRules" label-width="110px">
         <el-form-item label="策略名称" prop="name">
@@ -238,8 +280,12 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import {
+  Plus, Edit, Delete, Refresh, VideoPlay, VideoPause, CircleClose,
+  Document, Sunny, Setting
+} from '@element-plus/icons-vue'
 import {
   getStrategies, createStrategy, updateStrategy, deleteStrategy,
   startCrawl, pauseCrawl, resumeCrawl, stopCrawl, getCrawlStatus,
@@ -262,6 +308,7 @@ const defaultForm = () => ({
   name: '',
   target_url: '',
   rules: {
+    strategy_type: 'professional',
     depth: 1,
     allowed_domains: [],
     start_urls: [],
@@ -287,6 +334,18 @@ const defaultForm = () => ({
   Frequency: 'manual',
   creator_id: null
 })
+
+// ===== 策略类型选择 =====
+const typeDialogVisible = ref(false)
+
+// ===== 宝宝策略 =====
+const babyDialogVisible = ref(false)
+const babyFormRef = ref(null)
+const babyForm = reactive({ name: '', target_url: '' })
+const babyRules = {
+  name: [{ required: true, message: '请输入策略名称', trigger: 'blur' }],
+  target_url: [{ required: true, message: '请输入目标网址', trigger: 'blur' }]
+}
 
 const strategyForm = reactive(defaultForm())
 
@@ -326,10 +385,86 @@ const loadTasks = async () => {
 }
 
 const showCreateDialog = () => {
-  isEdit.value = false
-  editId.value = null
-  Object.assign(strategyForm, defaultForm())
-  dialogVisible.value = true
+  // 打开类型选择对话框
+  typeDialogVisible.value = true
+}
+
+const selectType = (type) => {
+  typeDialogVisible.value = false
+  if (type === 'baby') {
+    babyForm.name = ''
+    babyForm.target_url = ''
+    babyDialogVisible.value = true
+  } else if (type === 'professional') {
+    isEdit.value = false
+    editId.value = null
+    Object.assign(strategyForm, defaultForm())
+    strategyForm.rules.strategy_type = 'professional'
+    dialogVisible.value = true
+  }
+}
+
+// 策略类型标签
+const strategyTypeLabel = (row) => {
+  const t = row.rules?.strategy_type || 'professional'
+  return { baby: '宝宝策略', professional: '专业模式' }[t] || '专业模式'
+}
+const strategyTypeTag = (row) => {
+  const t = row.rules?.strategy_type || 'professional'
+  return { baby: 'warning', professional: '' }[t] || ''
+}
+
+// ===== 宝宝策略提交 =====
+const handleBabySubmit = async () => {
+  const valid = await babyFormRef.value.validate().catch(() => false)
+  if (!valid) return
+  submitLoading.value = true
+  try {
+    const payload = {
+      name: babyForm.name,
+      target_url: babyForm.target_url,
+      rules: {
+        strategy_type: 'baby',
+        depth: 1,
+        allowed_domains: [],
+        start_urls: [babyForm.target_url],
+        text_rules: { title_selector: 'h1', body_selector: 'body' },
+        image_rules: {
+          image_selector: 'img',
+          download_images: false,
+          image_dir: './images',
+          image_container_selector: null,
+          only_article_images: true,
+          min_width: 150,
+          min_height: 150,
+          min_area: 30000,
+          max_ratio: 5.0,
+          exclude_keywords: ['ad', 'ads', 'advert', 'banner', 'logo', 'icon', 'sprite', 'avatar', 'share', 'wechat', 'wx', 'tracking', 'pixel', 'recommend']
+        },
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        timeout: 30,
+        rate_limit: 1,
+        duplicate_action: 'overwrite'
+      },
+      Status: 'enabled',
+      Frequency: 'manual',
+      creator_id: null
+    }
+    const created = await createStrategy(payload)
+    ElMessage.success('宝宝策略创建成功，即将开始爬取')
+    babyDialogVisible.value = false
+    loadStrategies()
+    // 自动启动爬取
+    if (created && created.id) {
+      await startCrawl(created.id)
+      selectedStrategyId.value = created.id
+      refreshStatus()
+    }
+  } catch (e) {
+    ElMessage.error('创建失败：' + (e.response?.data?.detail || e.message))
+  } finally {
+    submitLoading.value = false
+  }
 }
 
 const showEditDialog = (row) => {
@@ -473,6 +608,47 @@ onUnmounted(() => {
   font-weight: bold;
   color: #303133;
 }
+
+/* ===== 策略类型选择卡片 ===== */
+.strategy-type-cards {
+  display: flex;
+  gap: 16px;
+}
+.type-card {
+  flex: 1;
+  border: 2px solid #e4e7ed;
+  border-radius: 10px;
+  padding: 20px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.25s;
+}
+.type-card:hover {
+  border-color: #409eff;
+  box-shadow: 0 4px 12px rgba(64, 158, 255, 0.15);
+  transform: translateY(-2px);
+}
+.type-icon {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 12px;
+}
+.type-title {
+  font-size: 16px;
+  font-weight: bold;
+  color: #303133;
+  margin-bottom: 8px;
+}
+.type-desc {
+  font-size: 12px;
+  color: #909399;
+  line-height: 1.6;
+}
+
 .control-card {
   margin-bottom: 16px;
 }

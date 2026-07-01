@@ -1,12 +1,22 @@
 """
 数据查询代理服务 - 为前端提供 webpages/contents/images/websites 查询接口
 不修改后端 CRAWLER_NEW.py，独立运行在 8002 端口
+
+提供功能：
+- /webpages、/contents、/images、/websites 数据查询接口
+- /tasks/{task_id} 任务级联删除
+- /strategy/{strategy_id}/cascade 策略级联删除
+- /strategies/{strategy_id} 策略更新
 """
 import os
 import json
-from fastapi import FastAPI
+import logging
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 import pymysql
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("data_proxy")
 
 DB_CONFIG = {
     "host": os.environ.get("DB_HOST", "172.31.224.1"),
@@ -16,6 +26,10 @@ DB_CONFIG = {
     "database": os.environ.get("DB_NAME", "crawler_db"),
     "charset": "utf8mb4"
 }
+
+# 爬虫系统目录（CRAWLER_NEW.py 运行目录，图片保存在其下的 images/）
+# data_proxy.py 在 crawler-frontend/ 下，上级目录的"爬虫数据库系统"即为爬虫工作目录
+CRAWLER_BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "爬虫数据库系统")
 
 app = FastAPI(title="Crawler Data Query Proxy", version="1.0.0")
 
@@ -62,17 +76,170 @@ def list_webpages():
 
 @app.get("/contents")
 def list_contents():
-    return query_all("SELECT * FROM content ORDER BY id DESC")
+    # 关联 webpage（取 fetch_time 爬取时间、task_id）、task_record（取 strategy_id）、datasource（取 publisher_name 发布者）
+    return query_all("""
+        SELECT c.*,
+               w.fetch_time   AS crawl_time,
+               w.task_id      AS task_id,
+               t.strategy_id  AS strategy_id,
+               ds.publisher_name AS Publisher,
+               ds.origin_url  AS datasource_url
+        FROM content c
+        LEFT JOIN webpage w     ON c.webpage_id = w.id
+        LEFT JOIN task_record t ON w.task_id = t.id
+        LEFT JOIN datasource ds ON c.datasource_id = ds.id
+        ORDER BY c.id DESC
+    """)
 
 
 @app.get("/images")
 def list_images():
-    return query_all("SELECT * FROM image ORDER BY id DESC")
+    # 关联 webpage（取 task_id）、task_record（取 strategy_id），便于前端按任务/策略筛选
+    return query_all("""
+        SELECT i.*,
+               w.task_id      AS task_id,
+               t.strategy_id  AS strategy_id
+        FROM image i
+        LEFT JOIN webpage w     ON i.webpage_id = w.id
+        LEFT JOIN task_record t ON w.task_id = t.id
+        ORDER BY i.id DESC
+    """)
+
+
+@app.get("/image_file/{image_id}")
+def get_image_file(image_id: int):
+    """
+    根据图片ID读取本地已下载的图片文件并返回。
+    解决外链图片URL带token时效性/防盗链导致浏览器无法直接加载的问题。
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT local_path FROM image WHERE id = %s", (image_id,))
+            row = cursor.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="图片记录不存在")
+
+    local_path = row.get("local_path", "")
+    if not local_path:
+        raise HTTPException(status_code=404, detail="该图片无本地路径")
+
+    # local_path 形如 "./images/xxx.jpg"，是相对于 CRAWLER_NEW.py 运行目录的路径
+    # 映射为绝对路径
+    if local_path.startswith("./"):
+        abs_path = os.path.join(CRAWLER_BASE_DIR, local_path[2:])
+    elif local_path.startswith("/"):
+        abs_path = local_path
+    else:
+        abs_path = os.path.join(CRAWLER_BASE_DIR, local_path)
+
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail="本地图片文件不存在")
+
+    # 根据文件扩展名确定 Content-Type
+    ext = os.path.splitext(abs_path)[1].lower()
+    content_type_map = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".gif": "image/gif",
+        ".webp": "image/webp", ".bmp": "image/bmp",
+    }
+    content_type = content_type_map.get(ext, "application/octet-stream")
+
+    with open(abs_path, "rb") as f:
+        content = f.read()
+    return Response(content=content, media_type=content_type)
 
 
 @app.get("/websites")
 def list_websites():
     return query_all("SELECT * FROM website ORDER BY id DESC")
+
+
+# ==================== 内容与图片的删除接口 ====================
+
+@app.delete("/contents/{content_id}")
+def delete_content(content_id: int):
+    """删除单条文本内容"""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM content WHERE id = %s", (content_id,))
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"内容不存在: {content_id}")
+            return {"msg": "content deleted", "content_id": content_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/contents/batch-delete")
+def batch_delete_contents(payload: dict):
+    """批量删除文本内容"""
+    ids = payload.get("ids", [])
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ",".join(["%s"] * len(ids))
+            cursor.execute(f"DELETE FROM content WHERE id IN ({placeholders})", ids)
+            deleted = cursor.rowcount
+            conn.commit()
+            return {"msg": "batch delete done", "deleted_count": deleted}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.delete("/images/{image_id}")
+def delete_image(image_id: int):
+    """删除单条图片记录"""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM image WHERE id = %s", (image_id,))
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"图片不存在: {image_id}")
+            return {"msg": "image deleted", "image_id": image_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/images/batch-delete")
+def batch_delete_images(payload: dict):
+    """批量删除图片记录"""
+    ids = payload.get("ids", [])
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cursor:
+            placeholders = ",".join(["%s"] * len(ids))
+            cursor.execute(f"DELETE FROM image WHERE id IN ({placeholders})", ids)
+            deleted = cursor.rowcount
+            conn.commit()
+            return {"msg": "batch delete done", "deleted_count": deleted}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
 
 @app.delete("/tasks/{task_id}")
@@ -100,7 +267,6 @@ def delete_task(task_id: int):
             return {"msg": "task and related data deleted", "task_id": task_id, "deleted_webpages": len(webpage_ids)}
     except Exception as e:
         conn.rollback()
-        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
@@ -131,7 +297,6 @@ def delete_strategy_cascade(strategy_id: int):
             return {"msg": "strategy and all related data deleted", "strategy_id": strategy_id, "deleted_tasks": len(task_ids)}
     except Exception as e:
         conn.rollback()
-        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
@@ -146,7 +311,6 @@ def update_strategy(strategy_id: int, payload: dict):
             # 检查策略是否存在
             cursor.execute("SELECT id FROM crawler_strategy WHERE id = %s", (strategy_id,))
             if not cursor.fetchone():
-                from fastapi import HTTPException
                 raise HTTPException(status_code=404, detail="Strategy not found")
 
             updates = []
@@ -177,7 +341,6 @@ def update_strategy(strategy_id: int, payload: dict):
                 params.append(payload["creator_id"])
 
             if not updates:
-                from fastapi import HTTPException
                 raise HTTPException(status_code=400, detail="No fields to update")
 
             updates.append("updated_at = NOW()")
@@ -202,11 +365,10 @@ def update_strategy(strategy_id: int, payload: dict):
             if 'rules_json' in result and result['rules_json']:
                 result['rules'] = json.loads(result['rules_json'])
             return result
+    except HTTPException:
+        raise
     except Exception as e:
         conn.rollback()
-        if isinstance(e, HTTPException):
-            raise e
-        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()

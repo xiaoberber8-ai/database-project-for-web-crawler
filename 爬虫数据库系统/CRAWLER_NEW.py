@@ -2,6 +2,8 @@ import os
 import re
 import json
 import time
+import socket
+import base64
 import hashlib
 import logging
 import threading
@@ -29,6 +31,15 @@ from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
 from io import BytesIO
 from PIL import Image as PILImage
+
+# 搜狐图片 AES 解密（data-src 加密场景）
+try:
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import unpad
+    _SOHU_AES_KEY = b"www.sohu.com6666"
+    _HAS_CRYPTO = True
+except ImportError:
+    _HAS_CRYPTO = False
 
 # =========================
 # 日志配置
@@ -245,6 +256,7 @@ class ImageRules(BaseModel):     #这是修改部分，有关图片过滤器
 
 
 class StrategyRules(BaseModel):
+    strategy_type: str = Field(default="professional", description="策略类型: baby(宝宝策略) / professional(专业模式)")
     depth: int = 1
     allowed_domains: List[str] = Field(default_factory=list)
     start_urls: List[str] = Field(default_factory=list)
@@ -666,6 +678,23 @@ class CrawlerExecutor:
                 if dt:
                     return dt
 
+        # 6) 原始 HTML 兜底：某些网站（如百度百家号）将发布时间嵌在 JS 变量中，
+        #    soup.get_text() 不包含 script 内容，需搜索原始 HTML
+        if html:
+            # 限定搜索带时间的完整日期格式，避免误匹配纯日期
+            full_datetime_patterns = [
+                r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})[ T](\d{1,2}:\d{2}:\d{2})",
+                r"(20\d{2})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}:\d{2}:\d{2})",
+            ]
+            for pattern in full_datetime_patterns:
+                m = re.search(pattern, html)
+                if m:
+                    year, month, day, t = m.group(1), m.group(2), m.group(3), m.group(4)
+                    candidate = f"{year}-{month.zfill(2)}-{day.zfill(2)} {t}"
+                    dt = self._parse_datetime_string(candidate)
+                    if dt:
+                        return dt
+
         return None
 
     def __init__(self):
@@ -766,8 +795,29 @@ class CrawlerExecutor:
 
             ensure_dir(rule.image_dir)
 
+            # ===== 爬取前 DNS 连通性预检查 =====
+            # 提前发现 DNS 故障，避免任务"成功完成"但 0 条数据的误导
+            check_url = (rule.start_urls[0] if rule.start_urls else strategy.target_url).strip()
+            check_domain = urlparse(check_url).netloc
+            if check_domain:
+                try:
+                    socket.gethostbyname(check_domain)
+                except Exception as dns_err:
+                    dns_msg = (
+                        f"DNS解析失败，无法解析域名 '{check_domain}': {dns_err}。"
+                        f"请检查系统DNS配置（/etc/resolv.conf）是否指向可用的DNS服务器。"
+                    )
+                    task.error_message = dns_msg
+                    task.Status = "failed"
+                    task.end_time = datetime.now()
+                    db.commit()
+                    logger.error(f"任务因DNS预检查失败: task_id={task_id}, domain={check_domain}, err={dns_err}")
+                    return
+
             visited = set()
             queue = [(u, 0) for u in rule.start_urls]
+            failed_count = 0
+            last_error_msg = None
 
             while queue and not self.stop_event.is_set():
                 if not self._wait_if_paused():
@@ -816,7 +866,7 @@ class CrawlerExecutor:
                     soup = BeautifulSoup(html, "lxml")
 
                     title = self._extract_title(soup, rule)
-                    text_body = self._extract_text(soup, rule)
+                    text_body = self._extract_text(soup, rule, html)
                     keywords = self._extract_keywords(soup)
                     publish_time = self._extract_publish_time(soup, html)
                     # 新增核心：提取公司和联系方式，并动态补全 Website 表中的空白元数据
@@ -827,7 +877,7 @@ class CrawlerExecutor:
                     if contact_info and not website.contact_info:
                         website.contact_info = contact_info
                     # 每次抽取到新内容时如果发现网站元数据为空，就会自动帮其在数据库中补全
-                    
+
                     datasource = self._get_or_create_datasource(db, url, soup, rule)
 
                     content = Content(
@@ -839,18 +889,25 @@ class CrawlerExecutor:
                         keywords=keywords
                     )
                     db.add(content)
+                    # 先提交 Content，确保即使后续图片提取失败，文本数据也不会丢失
+                    db.commit()
 
+                    # 图片提取单独 try-except，避免图片处理失败导致 Content 丢失
                     image_count = 0
                     if rule.download_images:
-                        image_count = self._extract_and_save_images(
-                            db=db,
-                            soup=soup,
-                            base_url=url,
-                            webpage_id=page.id,
-                            rule=rule,
-                            headers=rule.headers,
-                            timeout=rule.timeout,
-                        )
+                        try:
+                            image_count = self._extract_and_save_images(
+                                db=db,
+                                soup=soup,
+                                base_url=url,
+                                webpage_id=page.id,
+                                rule=rule,
+                                headers=rule.headers,
+                                timeout=rule.timeout,
+                                html=html,
+                            )
+                        except Exception as img_err:
+                            logger.warning(f"图片提取失败（不影响文本）: task_id={task_id}, url={url}, err={img_err}")
 
                     if depth + 1 < rule.depth:
                         for link in self._extract_links(soup, url, rule.link_selector):
@@ -867,10 +924,21 @@ class CrawlerExecutor:
                 except Exception as e:
                     page.process_status = "failed"
                     page.error_message = str(e)
+                    failed_count += 1
+                    last_error_msg = str(e)
+                    logger.warning(f"页面抓取失败: task_id={task_id}, url={url}, err={e}")
                     db.commit()
 
             # 循环结束，更新任务状态
-            final_status = "completed" if not self.stop_event.is_set() else "cancelled"
+            # 如果所有页面都失败了，标记任务为 failed 并记录错误摘要
+            if (task.item_count or 0) == 0 and failed_count > 0:
+                task.error_message = (
+                    f"全部 {failed_count} 个页面抓取失败。最后错误: {last_error_msg}"
+                )
+                final_status = "failed"
+                logger.warning(f"任务所有页面失败: task_id={task_id}, failed_count={failed_count}")
+            else:
+                final_status = "completed" if not self.stop_event.is_set() else "cancelled"
             logger.info(
                 f"任务循环结束: task_id={task_id}, 即将设置状态={final_status}, "
                 f"item_count={task.item_count}, stop_event={self.stop_event.is_set()}"
@@ -1025,16 +1093,197 @@ class CrawlerExecutor:
             return ds
 
     def _extract_title(self, soup: BeautifulSoup, rule: CrawlRule) -> str:
+        """
+        多级回退提取标题：
+        1. 优先使用策略配置的 title_selector
+        2. 回退到 h1 标签
+        3. 回退到 meta[property=og:title]
+        4. 回退到 <title> 标签
+        """
+        # 1. 优先使用策略配置的选择器
         node = soup.select_one(rule.title_selector)
-        return node.get_text(" ", strip=True) if node else ""
+        if node:
+            text = node.get_text(" ", strip=True)
+            if text:
+                return text
 
-    def _extract_text(self, soup: BeautifulSoup, rule: CrawlRule) -> str:
+        # 2. 回退到 h1 标签
+        h1 = soup.find("h1")
+        if h1:
+            text = h1.get_text(" ", strip=True)
+            if text:
+                return text
+
+        # 3. 回退到 og:title meta 标签
+        og_title = soup.find("meta", attrs={"property": "og:title"})
+        if og_title and og_title.get("content"):
+            return og_title["content"].strip()
+
+        # 4. 回退到 <title> 标签
+        title_tag = soup.find("title")
+        if title_tag:
+            text = title_tag.get_text(strip=True)
+            # 清理常见的站点后缀，如 "xxx_新浪新闻"、"xxx-百度百家号"
+            for sep in ["_", "-", "|"]:
+                if sep in text:
+                    parts = text.split(sep)
+                    # 取最长的部分作为标题（通常是正文标题，不是站点名）
+                    text = max(parts, key=len).strip()
+            if text:
+                return text
+
+        return ""
+
+    def _extract_text(self, soup: BeautifulSoup, rule: CrawlRule, html: str = "") -> str:
+        # 1. 优先尝试从 <script> 中的 JS 变量提取真实正文（央视等 JS 渲染页面）
+        #    当页面用 JS 动态填充正文时，body_selector 抓到的常是空 div 或 "正在加载" 占位符
+        if html:
+            js_html = self._extract_js_rendered_html(html)
+            if js_html:
+                try:
+                    sub_soup = BeautifulSoup(js_html, "lxml")
+                    self._clean_boilerplate(sub_soup)
+                    js_text = self._filter_nav_lines(sub_soup.get_text("\n", strip=True))
+                    if js_text and len(js_text) >= 20:
+                        return js_text
+                except Exception:
+                    pass
+
+        # 2. 回退到 CSS 选择器
         node = soup.select_one(rule.body_selector)
         if not node:
             node = soup.body
         if not node:
             return ""
-        return node.get_text("\n", strip=True)
+        # 清除导航栏、页眉页脚、脚本样式等无关元素后再提取文本
+        self._clean_boilerplate(node)
+        raw_text = node.get_text("\n", strip=True)
+        return self._filter_nav_lines(raw_text)
+
+    def _clean_boilerplate(self, node) -> None:
+        """
+        就地清除节点中的导航、页眉页脚、脚本样式等与正文无关的元素。
+        在 get_text 前调用，避免抓到大量菜单/导航文本（如新浪新闻的频道列表）。
+        """
+        if node is None:
+            return
+        # 1. 删除标签级别明确的非正文元素
+        for tag_name in ('script', 'style', 'noscript', 'nav', 'header', 'footer',
+                         'aside', 'form', 'iframe', 'svg', 'button'):
+            for t in node.find_all(tag_name):
+                t.decompose()
+
+        # 2. 删除 class/id 命中导航/菜单/页眉页脚等模式的元素
+        #    使用正则匹配常见命名，覆盖 nav/menu/header/footer/sidebar/breadcrumb/share/comment 等
+        pattern = re.compile(
+            r'nav|menu|header|footer|sidebar|breadcrumb|topbar|top-bar|bottombar|bottom-bar|'
+            r'share|comment|recommend|related|toolbar|banner|advert|promo|popup|modal|'
+            r'login|register|copyright|backtotop|site-link|channel',
+            re.IGNORECASE
+        )
+        # 关键修复：遍历时需检查元素是否已被分解（父元素被删除后子元素会失效）
+        # 否则 elem.get('class') 会抛出 AttributeError: 'NoneType' object has no attribute 'get'
+        for elem in list(node.find_all(True)):
+            # 已被 decompose 的元素 parent 为 None，跳过
+            if elem.parent is None:
+                continue
+            try:
+                cls = elem.get('class') or []
+                cls_str = ' '.join(cls) if isinstance(cls, list) else str(cls)
+                elem_id = elem.get('id') or ''
+                if pattern.search(cls_str) or pattern.search(elem_id):
+                    elem.decompose()
+            except Exception:
+                continue
+
+    def _filter_nav_lines(self, text: str) -> str:
+        """
+        过滤文本中的导航菜单行和无关短文本。
+        依据：正文段落通常较长且以句末标点结尾；导航项通常是 2-4 字的短词（如"新闻""体育"）。
+        """
+        if not text:
+            return text
+        # 句末标点（中英文），有这些标点的行即使是短句也保留（如"好。""来源：新华社。"）
+        sentence_end = re.compile(r'[。！？!?.…]$')
+        # 纯符号行（如 ">" "×" "·" "|" "-"）
+        symbol_only = re.compile(r'^[\s\-\—\|\>\×\·\+\*\#\·\·]+$')
+        # 常见品牌/导航前缀（如"新浪新闻""新浪体育"等纯导航文本）
+        nav_prefixes = ('新浪首页', '新浪新闻', '新浪体育', '新浪财经', '新浪娱乐', '新浪科技',
+                        '新浪博客', '新浪图片', '新浪视频', '新浪游戏', '新浪邮箱', '新浪微博',
+                        '移动客户端', '注册', '登录', '热搜')
+
+        kept = []
+        for raw_line in text.split('\n'):
+            line = raw_line.strip()
+            if not line:
+                continue
+            # 保留以句末标点结尾的行（正文特征）
+            if sentence_end.search(line):
+                kept.append(line)
+                continue
+            # 过滤纯符号行
+            if symbol_only.match(line):
+                continue
+            # 过滤常见导航前缀行
+            if any(line.startswith(p) for p in nav_prefixes) and len(line) <= 12:
+                continue
+            # 过滤超短行（<=4 字符，且非句末），如"新闻""体育""财经"等导航菜单项
+            if len(line) <= 4:
+                continue
+            kept.append(line)
+        return '\n'.join(kept)
+
+    def _extract_js_rendered_html(self, html: str) -> Optional[str]:
+        """
+        检测 JavaScript 渲染型页面（如央视新闻），从 <script> 标签中
+        形如 `var contentdate = '<p>...</p>'` 的变量里提取真正的正文 HTML 字符串。
+        返回 HTML 字符串，如未找到返回 None。
+
+        央视新闻页的 #text_area 在初始 HTML 中是空的，正文 HTML 实际
+        藏在 script 变量 contentdate 中，由 JS 在前端运行时填充。
+        """
+        if not html:
+            return None
+
+        # 常见的 JS 变量名（央视新闻使用 contentdate）
+        var_names = [
+            "contentdate",
+            "content_data",
+            "article_content",
+            "article_data",
+            "contentHtml",
+            "articleHtml",
+            "pageContent",
+            "contenttext",
+            "detail_content",
+            "htmlContent",
+            "body_content",
+        ]
+
+        for name in var_names:
+            # 匹配 var name = '...' 或 var name = "..."
+            # 用 [\s\S] 允许跨行匹配；非贪婪避免吃掉过多内容
+            pattern = re.compile(
+                r"var\s+" + re.escape(name) + r"\s*=\s*(['\"])([\s\S]*?)\1\s*[;<\n]",
+                re.MULTILINE,
+            )
+            m = pattern.search(html)
+            if not m:
+                continue
+            raw = m.group(2)
+            # 必须像 HTML 内容（含 p/img/br/div 等标签）
+            if "<p" not in raw and "<img" not in raw and "<br" not in raw and "<div" not in raw:
+                continue
+            try:
+                sub_soup = BeautifulSoup(raw, "lxml")
+                text = sub_soup.get_text(" ", strip=True)
+                if not text or len(text) < 20:
+                    continue
+                return raw
+            except Exception:
+                continue
+
+        return None
 
     def _extract_keywords(self, soup: BeautifulSoup) -> str:
         meta = soup.select_one('meta[name="keywords"]')
@@ -1074,6 +1323,7 @@ class CrawlerExecutor:
             rule: CrawlRule,
             headers: Dict[str, Any],
             timeout: int,
+            html: str = "",
     ) -> int:
         """
         只抓正文区域中更像“内容配图”的图片：
@@ -1082,6 +1332,7 @@ class CrawlerExecutor:
         3. 支持 src / data-src / data-original / srcset
         4. 按最小宽高、最小面积、最大宽高比过滤
         5. 优先解析页面 script 中的 imgsList（搜狐等懒加载加密站点）
+        6. JS 渲染型页面（如央视）：从 script 变量 contentdate 中提取 <img>
         """
         count = 0
 
@@ -1166,16 +1417,67 @@ class CrawlerExecutor:
                 img_url = self._get_best_image_url(img, base_url)
                 if not img_url:
                     continue
-                # 跳过搜狐加密的 data-src（非URL形态）
+                # 搜狐加密 data-src：非 URL 形态，尝试 AES 解密还原真实图片地址
                 if not re.match(r"^https?://|^//", img_url):
-                    continue
+                    decrypted = self._decrypt_sohu_image_url(img_url)
+                    if decrypted:
+                        img_url = decrypted
+                    else:
+                        continue
                 if self._is_noise_image(img, img_url, rule):
                     continue
                 desc = img.get("alt", "") or ""
                 if _save_one(img_url, desc):
                     count += 1
 
+        # ===== 兜底路径 2：JS 渲染型页面（央视新闻等）=====
+        # 当 <img> 解析没抓到图片时，尝试从 script 变量 contentdate 中提取 <img>
+        # 这种页面正文 HTML 藏在 JS 变量里，soup.select("img") 拿不到
+        if count == 0 and html:
+            js_html = self._extract_js_rendered_html(html)
+            if js_html:
+                try:
+                    js_soup = BeautifulSoup(js_html, "lxml")
+                    for img in js_soup.select("img"):
+                        img_url = self._get_best_image_url(img, base_url)
+                        if not img_url:
+                            continue
+                        if not re.match(r"^https?://|^//", img_url):
+                            continue
+                        if self._is_noise_image(img, img_url, rule):
+                            continue
+                        desc = img.get("alt", "") or ""
+                        if _save_one(img_url, desc):
+                            count += 1
+                except Exception:
+                    pass
+
         return count
+
+    def _decrypt_sohu_image_url(self, raw: str) -> str:
+        """
+        解密搜狐文章 <img data-src> 中的加密字符串。
+        搜狐使用 AES-128-ECB（PKCS7 填充）加密图片 URL，密钥为 'www.sohu.com6666'。
+        解密后得到真实图片地址（如 http://img.mp.sohu.com/.../*.jpg）。
+        """
+        if not _HAS_CRYPTO or not raw:
+            return ""
+        raw = raw.strip()
+        # 加密串特征：Base64 字符集，长度>=32，不以 http 开头
+        if len(raw) < 32 or raw.startswith(("http://", "https://", "//", "data:")):
+            return ""
+        try:
+            cipher = AES.new(_SOHU_AES_KEY, AES.MODE_ECB)
+            decrypted = unpad(cipher.decrypt(base64.b64decode(raw)), AES.block_size)
+            url = decrypted.decode("utf-8")
+            # 校验解密结果是否为合法 URL
+            if url.startswith(("http://", "https://", "//")):
+                if url.startswith("//"):
+                    url = "https:" + url
+                return url
+            return ""
+        except Exception:
+            return ""
 
     def _extract_imgslist_from_scripts(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, Any]]:
         """
@@ -1292,6 +1594,13 @@ class CrawlerExecutor:
 # =========================
 
 app = FastAPI(title="Crawler DB System", version="1.0.0")
+
+# 挂载静态文件服务，让前端可以通过 HTTP 访问本地下载的图片
+from fastapi.staticfiles import StaticFiles
+_IMAGES_DIR = os.path.abspath("./images")
+if os.path.isdir(_IMAGES_DIR):
+    app.mount("/images", StaticFiles(directory=_IMAGES_DIR), name="images")
+
 crawler = CrawlerExecutor()
 crawl_thread: Optional[threading.Thread] = None
 

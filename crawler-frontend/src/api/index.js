@@ -53,4 +53,12 @@ export const getContents = () => dataApi.get('/contents')
 export const getImages = () => dataApi.get('/images')
 export const getWebsites = () => dataApi.get('/websites')
 
+// 内容删除（单条 + 批量）
+export const deleteContent = (id) => dataApi.delete(`/contents/${id}`)
+export const batchDeleteContents = (ids) => dataApi.post('/contents/batch-delete', { ids })
+
+// 图片删除（单条 + 批量）
+export const deleteImage = (id) => dataApi.delete(`/images/${id}`)
+export const batchDeleteImages = (ids) => dataApi.post('/images/batch-delete', { ids })
+
 export default api
